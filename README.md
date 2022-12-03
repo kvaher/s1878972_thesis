@@ -12,10 +12,10 @@ The repository consists of the following folders:
 - qc_decontam.Rmd: code for the quality check and decontamination steps for the 16S rRNA sequencing data
 - 16S_beta_diversity.Rmd: code to calculate Bray-Curtis dissimilarity matrix and conduct statistical analysis for clinical drivers of the beta diversity
 - alpha_diversity.Rmd: code to calculate alpha diversity metrics and conduct statistical analysis for clinical drivers of the alpha diversity; also includes calculation of clinical variable differences between male and female infants
-- microbiome_demotable.Rmd: code for creating study group demographics descriptive tables
-- sequencing_comparison.Rmd: code for the differences between meconium samples with and without sufficient bacterial yield for sequencing
 - hclust.Rmd: code for hierarchical clustering plot
 - 16S_relative_abundance.Rmd: code for Maaslin2 models for the clinical covariates
+- microbiome_demotable.Rmd: code for creating study group demographics descriptive tables
+- sequencing_comparison.Rmd: code for the differences between meconium samples with and without sufficient bacterial yield for sequencing
 
 ## Chapter 6.	Neonatal microbiome and brain dysmaturation in preterm infants
 - 16S_ordination.Rmd: code to derive principal coordinates of microbiota data
