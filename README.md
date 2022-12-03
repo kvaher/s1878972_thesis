@@ -10,11 +10,11 @@ The repository consists of the following folders:
 
 ## Chapter 5.	Microbiota profiles and drivers in preterm neonates
 - qc_decontam.Rmd: code for the quality check and decontamination steps for the 16S rRNA sequencing data
+- 16S_beta_diversity.Rmd: code to calculate Bray-Curtis dissimilarity matrix and conduct statistical analysis for clinical drivers of the beta diversity
+- alpha_diversity.Rmd: code to calculate alpha diversity metrics and conduct statistical analysis for clinical drivers of the alpha diversity; also includes calculation of clinical variable differences between male and female infants
 - microbiome_demotable.Rmd: code for creating study group demographics descriptive tables
 - sequencing_comparison.Rmd: code for the differences between meconium samples with and without sufficient bacterial yield for sequencing
-- 16S_beta_diversity.Rmd: code to calculate Bray-Curtis dissimilarity matrix and conduct statistical analysis for clinical drivers of the beta diversity
 - hclust.Rmd: code for hierarchical clustering plot
-- alpha_diversity.Rmd: code to calculate alpha diversity metrics and conduct statistical analysis for clinical drivers of the alpha diversity
 - 16S_relative_abundance.Rmd: code for Maaslin2 models for the clinical covariates
 
 ## Chapter 6.	Neonatal microbiome and brain dysmaturation in preterm infants
