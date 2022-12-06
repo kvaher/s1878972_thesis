@@ -1,0 +1,314 @@
+-----
+title: "`r subdir_name`"
+author: "Kadi Vaher"
+date: "`r Sys.time()`"
+output: html_document
+---
+
+```{r setup, include=T, message=F}
+subdir_name <- "microbiome_demotable"
+
+# load packages
+library(tidyverse)
+library(here)
+library(magrittr)
+library(glue)
+library(ggpubr)
+library(knitr)
+library(MVN)
+library(tableone)
+
+# set paths
+knitr::opts_knit$set(root.dir = ".", aliases = c(h = "fig.height", w = "fig.width", ow = "out.width"))
+knitr::opts_chunk$set(
+  dev = c("png"),
+  fig.path = here("results", "figures", glue("{subdir_name}/")), dpi = 300
+)
+theme_set(theme_light()) # global option for ggplot2
+```
+
+```{r knit, echo=F, eval=FALSE}
+rmarkdown::render(
+  input = here("scripts", str_c(subdir_name, ".Rmd")),
+  output_file = here("results", "reports", paste(subdir_name, ".html", sep="_"))
+)
+```
+
+# Load data
+
+Change filenames here to have the most updated versions if needed
+These files are outputted from scripts for organising the metadata (specifically demographics_master; not uploaded to github currently) 
+
+```{r load_data}
+
+all_samples_demo <- read.csv(here("processed_data", "demographics_microbiome_samples_250_01092022.csv"), header=T)
+
+demo <- read.csv(here("processed_data", "demographics_microbiome_subjects_206_01092022.csv"), header=T)
+
+```
+
+# Exclude those who died
+
+```{r filter}
+
+demo <- demo %>% subset(! (cos_excluded_options %in% c(3,4)))
+
+
+all_samples_demo <- all_samples_demo %>% subset(! (cos_excluded_options %in% c(3,4)))
+
+#keep those that went for sequencing
+all_seq <- all_samples_demo %>% subset(seq_16s==1)
+all_seq_subj <- unique(all_seq$record_id)
+demo_seq <- demo %>% subset(record_id %in% all_seq_subj)
+
+
+#only meconium samples to compare those that had enough dna for sequencing vs those with low yield
+all_mec_demo <- all_samples_demo %>% subset(Visit_number=="V1")
+
+
+```
+
+# Checking normality of the variables
+Do it separately for term and preterm infants
+But also look at the full cohort together because I only have 16 term infants with sequencing data (and 4 had to be excluded in the end due to low read count)
+Also do it only for the infants who actually have sequencing data because this is the table I will include in paper/thesis
+
+```{r normality}
+
+numvars <- demo_seq %>% select(GA_birth, birthweight_g, birthweight_z_score, membr_rupt_durations_hours, days_nnu,
+                               totaldays, prop_abx_totaldays, GA_discharge, prop_days_excl_any_breastmilk, prop_days_excl_formula, prop_days_mixed_feed,
+                               maternal_age, bmi_at_booking)
+
+preterms_demoseq <- demo_seq %>% subset(preterm==1) %>% select(GA_birth, birthweight_g, birthweight_z_score, membr_rupt_durations_hours, days_nnu,
+                               totaldays, prop_abx_totaldays, GA_discharge, prop_days_excl_any_breastmilk, prop_days_excl_formula, prop_days_mixed_feed,
+                               maternal_age, bmi_at_booking)
+terms_demoseq <- demo_seq %>% subset(preterm==0) %>% select(GA_birth, birthweight_g, birthweight_z_score, membr_rupt_durations_hours, days_nnu,
+                               totaldays, prop_abx_totaldays, GA_discharge, prop_days_excl_any_breastmilk, prop_days_excl_formula, prop_days_mixed_feed,
+                               maternal_age, bmi_at_booking)
+
+
+mvn(data = numvars, univariateTest = "SW", univariatePlot = "qqplot")
+mvn(data = numvars, univariateTest = "SW", univariatePlot = "histogram")
+
+#also look in preterms only
+mvn(data = preterms_demoseq, univariateTest = "SW", univariatePlot = "qqplot")
+mvn(data = preterms_demoseq, univariateTest = "SW", univariatePlot = "histogram")
+
+#no point in doing this in terms as they will only have 16 datapoints and most continuous variables are NA as NNU specific
+
+```
+
+Normally distributed in full dataset: birthweight_g, maternal_age
+Same in preterms only
+
+# Make demographic/clinical data descriptive table
+
+## For all subjects
+
+There are warnings because term infants do not have clinical data available so cannot do statistical tests - this is fine.
+
+``` {r demotable}
+
+allVars <- c("GA_birth", "sex", 
+             "birthweight_g", "birthweight_z_score", 
+             "Vaginal_delivery", 
+             "antenatal_steroids_given", "mgso_any", 
+             "labour_antibiotics", "membr_rupt_durations_hours",
+             "days_nnu",  
+             "bronchopulmonary_dysplasia", "nec_binary",
+             "sepsis_binary", "retinopathy_or_premat", 
+             "AB_before72h", "AB_after72h", "totaldays", "prop_abx_totaldays",
+             "GA_discharge", "BM_75",
+             "prop_days_excl_any_breastmilk", "prop_days_excl_formula", "prop_days_mixed_feed", "feeding_at_discharge",
+             "maternal_age", "bmi_at_booking",
+             "SIMD_perinatal",
+             "maternal_final_education", "paternal_final_education")
+
+catVars <- c("sex", 
+             "Vaginal_delivery",
+             "antenatal_steroids_given", "mgso_any", "labour_antibiotics","BM_75",
+             "bronchopulmonary_dysplasia", "nec_binary", "AB_before72h", "AB_after72h",
+             "sepsis_binary", "retinopathy_or_premat",
+             "feeding_at_discharge",
+             "SIMD_perinatal",
+             "maternal_final_education", "paternal_final_education")
+
+nnvars <- c("GA_birth", "birthweight_z_score", "membr_rupt_durations_hours", "days_nnu",
+                               "totaldays", "prop_abx_totaldays", "GA_discharge", "prop_days_excl_any_breastmilk", "prop_days_excl_formula", "prop_days_mixed_feed",
+                               "bmi_at_booking")
+
+
+#table for all subjects who had samples collected
+descr_table <- CreateTableOne(vars=allVars, strata="preterm", data=demo, factorVars = catVars, includeNA = T, addOverall = T) #errors because we have missing values
+matrix_descr_table <- print(descr_table, showAllLevels = T, nonnormal = nnvars, minMax = T, explain=T, exact = catVars, contDigits = 3, printToggle = F, noSpaces = T)
+
+
+#table for all subjects whose samples went to miseq sequencing
+descr_table2 <- CreateTableOne(vars=allVars, strata="preterm", data=demo_seq, factorVars = catVars, includeNA = T, addOverall = T) #errors because we have missing values
+matrix_descr_table2 <- print(descr_table2, showAllLevels = T, nonnormal = nnvars, minMax = T, explain=T, exact = catVars, contDigits = 3, printToggle = F, noSpaces = T)
+
+
+write.csv(matrix_descr_table, file=here("results", "tables", "descriptive_stats_microb_subj_all.csv"))
+write.csv(matrix_descr_table2, file=here("results", "tables", "descriptive_stats_microb_subj_miseq.csv"))
+
+
+#also do table for subjects that are included in the very final dataset
+#first remove some samples
+final_sample_demo <- all_seq %>% subset(! sample_id %in% c("TW_03_8100_V1", "TW_03_8169_V1", "TW_03_8203_V1",
+                                                           "TW_03_8206_V1", "TW_03_8368_V1", "TW_03_8370_V1",
+                                                           "TW_03_8402_V1", "TW_03_8448_V1"))
+final_subjects <- unique(final_sample_demo$record_id)
+final_subjects_demo <- demo %>% subset(record_id %in% final_subjects)
+
+descr_table3 <- CreateTableOne(vars=allVars, strata="preterm", data=final_subjects_demo, factorVars = catVars, includeNA = T, addOverall = T) #errors because we have missing values
+matrix_descr_table3 <- print(descr_table3, showAllLevels = T, nonnormal = nnvars, minMax = T, explain=T, exact = catVars, contDigits = 3, printToggle = F, noSpaces = T)
+
+write.csv(matrix_descr_table3, file=here("results", "tables", "descriptive_stats_microb_finalsubjects.csv"))
+
+```
+
+## For meconium samples (low vs sufficient DNA yield for sequencing)
+Make a demographics table comparing babies whose mec samples had enough DNA to be sent to sequencing
+
+``` {r demotable_meconium}
+
+#first check normal distributions
+
+mec_numvars <- all_mec_demo %>% select(GA_birth, postnatal_age_at_sample_d, PMA_sample_w,
+             birthweight_g, birthweight_z_score, 
+             days_nnu,  
+             GA_discharge, 
+             maternal_age, bmi_at_booking)
+
+mvn(data = mec_numvars, univariateTest = "SW", univariatePlot = "qqplot")
+mvn(data = mec_numvars, univariateTest = "SW", univariatePlot = "histogram")
+
+#normally distributed: PMA_sample_w, maternal_age
+
+allVars2 <- c("preterm", "GA_birth", "postnatal_age_at_sample_d", "PMA_sample_w",
+             "sex", "birthweight_g", "birthweight_z_score", 
+             "Vaginal_delivery", "antenatal_steroids_given", "mgso_any", 
+             "labour_antibiotics", "AB_before72h", "AB_after72h",
+             "days_nnu",  
+             "bronchopulmonary_dysplasia", "nec_binary",
+             "sepsis_binary", "retinopathy_or_premat",
+             "GA_discharge", 
+             "maternal_age", "bmi_at_booking", "SIMD_perinatal")
+
+catVars2 <- c("preterm",
+             "sex", 
+             "Vaginal_delivery", "antenatal_steroids_given", "mgso_any", 
+             "labour_antibiotics", "AB_before72h", "AB_after72h",
+             "bronchopulmonary_dysplasia", "nec_binary",
+             "sepsis_binary", "retinopathy_or_premat", "SIMD_perinatal")
+
+nnvars2 <- c("GA_birth", "postnatal_age_at_sample_d",
+             "birthweight_g", "birthweight_z_score", 
+             "days_nnu",  
+             "GA_discharge", 
+             "bmi_at_booking")
+
+#table for all subjects who had samples collected
+descr_table3 <- CreateTableOne(vars=allVars2, strata="seq_16s", data=all_mec_demo, factorVars = catVars2, includeNA = T, addOverall = T) #errors because we have missing values
+matrix_descr_table3 <- print(descr_table3, showAllLevels = T, nonnormal = nnvars2, minMax = T, explain=T, exact = catVars, contDigits = 3, printToggle = F, noSpaces = T)
+
+write.csv(matrix_descr_table3, file=here("results", "tables", "descriptive_stats_meconium_subj_miseqvsnot.csv"))
+
+
+```
+
+Calculate some ages to include in the thesis
+
+```{r discharge}
+
+discharge <- all_samples_demo %>% subset(Visit_number=="V2")
+
+#calculate how much difference is between GAdischarge and PMA at sample
+discharge <- discharge %>% mutate(diff_GAdisch_GAsample = GA_discharge - PMA_sample_w)
+
+#calculate the mean of this
+mean(discharge$diff_GAdisch_GAsample)
+median(discharge$diff_GAdisch_GAsample)
+hist(discharge$diff_GAdisch_GAsample)
+
+#some dates were recorded as later than actual discharge so will replace these with 0
+discharge <- discharge %>% mutate(diff_GAdisch_GAsample2 = ifelse(diff_GAdisch_GAsample < 0, 0, diff_GAdisch_GAsample))
+
+mean(discharge$diff_GAdisch_GAsample2)
+median(discharge$diff_GAdisch_GAsample2)
+min(discharge$diff_GAdisch_GAsample2)
+max(discharge$diff_GAdisch_GAsample2)
+hist(discharge$diff_GAdisch_GAsample2)
+sd(discharge$diff_GAdisch_GAsample2)
+
+#how many had samples collected earlier than X weeks of discharge (and the proportion)
+sum(discharge$diff_GAdisch_GAsample2>2)
+sum(discharge$diff_GAdisch_GAsample2>2)/106
+
+sum(discharge$diff_GAdisch_GAsample2>3)
+sum(discharge$diff_GAdisch_GAsample2>3)/106
+
+sum(discharge$diff_GAdisch_GAsample2>4)
+sum(discharge$diff_GAdisch_GAsample2>4)/106
+
+
+#also calculate median and range for discharge sample ages
+shapiro.test(discharge$postnatal_age_at_sample_d)
+median(discharge$postnatal_age_at_sample_d)
+min(discharge$postnatal_age_at_sample_d)
+max(discharge$postnatal_age_at_sample_d)
+
+shapiro.test(discharge$PMA_sample_w)
+median(discharge$PMA_sample_w)
+min(discharge$PMA_sample_w)
+max(discharge$PMA_sample_w)
+
+
+preterm_mec <- all_samples_demo %>% subset(Visit_number=="V1" & preterm==1)
+hist(preterm_mec$postnatal_age_at_sample_d)
+ggqqplot(preterm_mec$postnatal_age_at_sample_d)
+hist(preterm_mec$GA_birth)
+ggqqplot(preterm_mec$GA_birth)
+cor.test(preterm_mec$postnatal_age_at_sample_d, preterm_mec$GA_birth, method="spearman")
+
+#also calculate median and range for preterm mec
+shapiro.test(preterm_mec$postnatal_age_at_sample_d)
+median(preterm_mec$postnatal_age_at_sample_d)
+min(preterm_mec$postnatal_age_at_sample_d)
+max(preterm_mec$postnatal_age_at_sample_d)
+
+shapiro.test(preterm_mec$PMA_sample_w)
+median(preterm_mec$PMA_sample_w)
+min(preterm_mec$PMA_sample_w)
+max(preterm_mec$PMA_sample_w)
+
+
+term_mec <- all_samples_demo %>% subset(Visit_number=="V1" & preterm==0)
+hist(term_mec$postnatal_age_at_sample_d)
+ggqqplot(term_mec$postnatal_age_at_sample_d)
+hist(term_mec$GA_birth)
+ggqqplot(term_mec$GA_birth)
+cor.test(term_mec$postnatal_age_at_sample_d, term_mec$GA_birth, method="spearman")
+
+#also calculate median and range for preterm mec
+shapiro.test(term_mec$postnatal_age_at_sample_d)
+median(term_mec$postnatal_age_at_sample_d)
+min(term_mec$postnatal_age_at_sample_d)
+max(term_mec$postnatal_age_at_sample_d)
+
+shapiro.test(term_mec$PMA_sample_w)
+median(term_mec$PMA_sample_w)
+min(term_mec$PMA_sample_w)
+max(term_mec$PMA_sample_w)
+
+#is postnatal age different between term and preterm meconium samples
+wilcox.test(term_mec$postnatal_age_at_sample_d, preterm_mec$postnatal_age_at_sample_d, paired=F) 
+
+
+#how many overlapping samples obtained
+length(all_samples_demo$record_id[duplicated(all_samples_demo$record_id)])
+
+#how many in the very final dataset
+length(final_sample_demo$record_id[duplicated(final_sample_demo$record_id)])
+
+```

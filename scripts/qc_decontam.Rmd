@@ -1,0 +1,2229 @@
+---
+title: "QC and decontam for TEBC faecal microbiome data"
+author: 
+  - "Kadi Vaher"
+  - "Based on QC script used in the Malawi microbiota workshop"
+date: '`r Sys.Date()`'
+output: html_document
+---
+
+```{r setup, include=F, message=F}
+
+library(tidyverse) 
+library(here) 
+library(phyloseq)
+library(decontam)
+library(RColorBrewer)
+library(knitr)
+library(ggpubr)
+library(vegan)
+library(ggrepel)
+#library(microbiome)
+
+# set paths
+knitr::opts_knit$set(root.dir=".", aliases=c(h = "fig.height", w = "fig.width", ow = "out.width"))
+knitr::opts_chunk$set(dev = c('png'), 
+                      fig.path = here("results", "figures", "qc_decontam", ""), dpi = 300)
+theme_set(theme_light()) # global option for ggplot2
+```
+
+# Run the whole document - ONLY AT THE END OF THE WORKSTREAM
+
+```{r knit, echo=F, eval=FALSE}
+rmarkdown::render(input = here("scripts", "qc_decontam.Rmd"), output_dir = here("results", "reports"))
+```
+
+# Load functions
+
+Here load some custom functions which support the analysis below. The scripts for these functions can be found in the `src/`-folder.
+The load_dada is for creating the ASV names, filtering out 'Mitochondria', 'Chloroplast', 'Archae' or 'Eukaryota'
+
+```{r}
+source(here("src", "load_dada.R"))
+source(here("src", "utils_kadi.R"))
+```
+
+# Load data into `phyloseq`
+
+This is to create a 'container' object, which contains the sequence table, taxonomic information, and metadata.
+
+## Load files
+
+```{r, message = F}
+# load ASV table (output from DADA2)
+seqtab <- readRDS(here("raw_data", "16S_dada2_output", "seqtab.rds"))
+
+# function to load taxonomy table
+read_tax <- function(path) {
+  read.table(path, stringsAsFactors = F) %>% 
+    as.matrix()
+}
+
+# load taxonomy table (output from DADA2)
+taxa <- read_tax(here("raw_data", "16S_dada2_output", "assigntaxonomy.tsv"))
+
+# load participant metadata
+meta <- read.csv(here("processed_data", "metadata_qc_decontam_23082022.csv")) %>%
+  column_to_rownames("sample_work_nr") %>% rename(sample_id2=sample_id)
+
+
+#match file row and column orders -> probably not required but just in case
+seqtab=seqtab[match(rownames(meta),rownames(seqtab)),]
+all(rownames(seqtab)==rownames(meta))
+
+taxa=taxa[match(colnames(seqtab),rownames(taxa)),]
+all(rownames(taxa)==colnames(seqtab))
+
+```
+
+## Combine in a phyloseq object
+`create_phylo` is a custom-made function to create a phyloseq object (also from the Malawi tutorial)
+But here I use the `create_phylo_fixed` function that is actually filtering out the taxa 
+
+```{r}
+ps <- list()
+
+# create a raw read phyloseq-object
+ps$raw <- create_phylo_fixed(seqtab, taxa, meta) 
+
+```
+
+# Descriptives/quality control
+
+Looking at dimensions of the data and checking basic statistics/descriptives
+
+```{r lib_size_box, fig.width=4, fig.height=3, out.width='40%'}
+
+#first: remove the primer-dimers (there was an error during library preparation: only primers were added but in the end they were also pooled)
+pd_samples <- meta %>% subset(sample_type=="pd")
+pd_samples <- row.names(pd_samples)
+ps$raw <- prune_samples(!(sample_names(ps$raw) %in% pd_samples), ps$raw)
+
+#also remove participants who sadly died
+dead_babies <- meta %>% subset(cos_excluded_options %in% c(3,4))
+dead_babies <- row.names(dead_babies)
+ps$raw <- prune_samples(!(sample_names(ps$raw) %in% dead_babies), ps$raw)
+
+# inspect phyloseq-object
+ps$raw
+
+# check the number of ASVs
+ntaxa(ps$raw)
+
+# check number of samples
+nsamples(ps$raw)
+
+# inspect variables contained in the metadata
+sample_data(ps$raw) %>% 
+  data.frame() %>%
+  head
+
+# add new variables to the metadata: for example, add raw read counts
+sample_data(ps$raw)$raw_reads <- sample_sums(ps$raw)
+sample_data(ps$raw)$type_timepoint <- case_when(sample_data(ps$raw)$sample_type == "sample" ~ sample_data(ps$raw)$group_timepoint,
+                                                sample_data(ps$raw)$sample_type != "sample" ~ sample_data(ps$raw)$sample_type)
+
+# check orientation ASV table (which is at the moment still called an OTU table within the phyloseq-package)
+otu_table(ps$raw)[1:5, 1:5]
+
+# check number of raw reads per sample after filtering
+data.frame(sample_data(ps$raw)) %>%
+  #filter(type != "mock") %>% # filter out the mocks
+  ggplot(aes(x = sample_type, y = raw_reads, color = sample_type)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(alpha = .15, width = 0.2) +
+  xlab("Type") +
+  ylab("Raw reads")
+# note that you need to transform the phyloseq metadata to a data.frame before being able to use tidyverse functions. Functions to make this transition smoother are included in the 'src/utils.R' script
+
+# check number of raw reads per sample after filtering: for the three sample types separated
+rawreads_fig <- data.frame(sample_data(ps$raw)) %>%
+  #filter(type != "mock") %>% # filter out the mocks
+  ggplot(aes(x = type_timepoint, y = raw_reads, color = type_timepoint)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(alpha = .4, width = 0.2) +
+  xlab("") +
+  ylab("Raw reads") +
+  theme_bw(base_size=13) +
+  scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3", "#E7298A", "#66A61E", "#E6AB02", "#A6761D", "#666666", "#4D808A"), name="", labels=c("Term meconium", "Preterm meconium", "Preterm pre-discharge",
+                                                            "Isolation blank", "Isolation mock (saliva)",
+                                                            "Isolation mock (ZMBC)",
+                                                            "MiSeq NMC", "MiSeq PCR blank", "MiSeq ZMC")) +
+  scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+                              "1_V2" = "Preterm pre-discharge", "iso_blank" = "Isolation blank", "iso_saliva"="Isolation mock (saliva)", "iso_zmcb"="Isolation mock (ZMBC)", "miseq_nmc"="MiSeq NMC", "miseq_pcr_blank"="MiSeq PCR blank", "miseq_zmc"="MiSeq ZMC")) +
+  theme(axis.text.x = element_text(angle=30, hjust=1), legend.position = "none")
+
+rawreads_fig
+
+png(file=here("results", "figures", "rawreads_fig.png"), width = 8, height = 6, units = "in",res=300)
+print(rawreads_fig)
+dev.off()
+
+#write out some numbers of reads
+kable(data.frame(sample_data(ps$raw)) %>% group_by(type_timepoint) %>% summarise(meanreads=mean(raw_reads),
+                                                                           minreads=min(raw_reads),
+                                                                           maxreads=max(raw_reads)))
+
+kable(data.frame(sample_data(ps$raw)) %>% group_by(sample_type) %>% summarise(meanreads=mean(raw_reads),
+                                                                           minreads=min(raw_reads),
+                                                                           maxreads=max(raw_reads)))
+
+# plot 16S qPCR data
+
+qpcr_conc_fig <- data.frame(sample_data(ps$raw)) %>%
+  filter(!(type_timepoint %in% c("miseq_nmc", "miseq_pcr_blank", "miseq_zmc"))) %>% # filter Miseq PCR mocks and blanks
+  ggplot(aes(x = type_timepoint, y = qpcr_16S_pgul, color = type_timepoint)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(alpha = .15, width = 0.2) +
+  scale_y_log10(labels = function(x) scales::comma(x, accuracy = 1)) +
+  xlab("") +
+  ylab("DNA concentration\n(16S qPCR; pg/ul)") +
+  theme_bw(base_size=13) +
+  scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3", "#E7298A", "#66A61E", "#E6AB02"), name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-discharge",
+                                                            "Isolation blank", "Isolation mock (saliva)",
+                                                            "Isolation mock (ZMBC)")) +
+  scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+                              "1_V2" = "Preterm pre-discharge", "iso_blank" = "Isolation blank", "iso_saliva"="Isolation mock (saliva)", "iso_zmcb"="Isolation mock (ZMBC)")) +
+  theme(axis.text.x = element_text(angle=30, hjust=1), legend.position = "none")
+
+qpcr_conc_fig
+
+png(file=here("results", "figures", "qpcr_conc_fig.png"), width = 8, height = 6, units = "in",res=300)
+print(qpcr_conc_fig)
+dev.off()
+
+
+```
+
+## Check for samples without reads
+## And number of taxa after filtering out 'Mitochondria', 'Chloroplast', 'Archae' or 'Eukaryota'
+
+```{r}
+table(sample_sums(ps$raw) == 0) #3 - these are all miseq pcr blanks
+
+table(ps$raw@sam_data$type_timepoint)
+
+#number of taxa
+ntaxa(ps$raw)
+```
+
+# Plot control samples
+
+It is important to visualise the composition of positive (mocks) and negative control (blanks) samples.
+I have:
+- two types of isolation mocks: zymo and saliva
+- two types of PCR mocks: NMC and ZMC
+- isolation blank
+
+
+## Prepare
+
+```{r}
+# create RA (relative abundance) phyloseq object
+ps$RA <- ps$raw %>% to_RA 
+# `to_RA` is a small helper function to convert raw reads to relative abundances (RA). These helper-functions can be found in the `src/load_dada.R` and `src/utils.R`-scripts and are also implemented in a small package called (`microbiomer`)[https://github.com/wsteenhu/microbiomer].
+
+ps_zymo_mock_RA <- subset_samples(ps$RA, sample_type == "iso_zmcb")
+ps_saliva_mock_RA <- subset_samples(ps$RA, sample_type == "iso_saliva")
+
+ps_zmc_mock_RA <- subset_samples(ps$RA, sample_type == "miseq_zmc")
+ps_nmc_mock_RA <- subset_samples(ps$RA, sample_type == "miseq_nmc")
+
+ps_iso_blank_RA <- subset_samples(ps$RA, sample_type == "iso_blank")
+ps_iso_blank_raw <- subset_samples(ps$raw, sample_type == "iso_blank")
+
+ps_pcr_blank_RA <- subset_samples(ps$RA, sample_type == "miseq_pcr_blank")
+ps_pcr_blank_raw <- subset_samples(ps$raw, sample_type == "miseq_pcr_blank")
+
+```
+
+
+## Plot mocks
+
+
+```{r mocks, w = 8, h = 4.5, ow='80%'}
+
+zymo_mock_bar_RA <- ps_zymo_mock_RA %>%
+  create_bar_revleg(., n=15, ncol_legend=2) + 
+  theme(legend.position = "right")
+
+zymo_mock_bar_RA
+
+saliva_mock_bar_RA <- ps_saliva_mock_RA %>%
+  create_bar_revleg(., n=15, ncol_legend=2) + 
+  theme(legend.position = "right")
+
+saliva_mock_bar_RA
+
+zmc_mock_bar_RA <- ps_zmc_mock_RA %>%
+  create_bar_revleg(., n=15, ncol_legend=2) + 
+  theme(legend.position = "right")
+
+zmc_mock_bar_RA
+
+nmc_mock_bar_RA <- ps_nmc_mock_RA %>%
+  create_bar_revleg(., n=15, ncol_legend=2) + 
+  theme(legend.position = "right")
+
+nmc_mock_bar_RA
+
+```
+
+## Plot all mocks together in one bar
+
+```{r all_mocks_together}
+
+ps_allmocks_RA <- subset_samples(ps$RA, sample_type == "iso_zmcb" | sample_type == "iso_saliva" | sample_type == "miseq_zmc" | sample_type == "miseq_nmc")
+
+
+all_mocks_fig <- ps_allmocks_RA %>%
+  create_bar_revleg2(., n = 20, ncol_legend = 2, id="sample_id2") +
+    theme(legend.position = "right", strip.text = element_text(size=12, color="black"), strip.background = element_rect(
+     color="black", fill="white", size=1, linetype="solid"), axis.text.x = element_blank()) + ggforce::facet_row(vars(sample_type), scales = "free", space = "free")
+
+all_mocks_fig
+
+png(file=here("results", "figures", "allmocks.png"), width = 11, height = 6, units = "in",res=300)
+print(all_mocks_fig)
+dev.off()
+
+
+```
+
+## Plot isolation blanks
+
+```{r iso_blanks, w = 8, h = 5.5, ow='80%'}
+
+iso_blanks_bar_RA <- ps_iso_blank_RA %>%
+  create_bar_revleg(., n = 15, ncol_legend = 2, id="sample_id2") +
+    theme(legend.position = "right")
+
+iso_blanks_raw_count <- ps_iso_blank_raw %>%
+  meta_to_df() %>%
+  ggplot(aes(x = sample_id, y = raw_reads)) +
+    geom_col() +
+    geom_text(aes(label = scales::comma(raw_reads, accuracy = 1)),  angle = 90, color = "white", hjust = 1, size = 2.5, nudge_y = -0.2) + 
+    #theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    theme(axis.text.x = element_blank()) +
+    scale_y_log10(labels = scales::comma) +
+    labs(x = "", y = "Raw read count")
+
+cowplot::plot_grid(iso_blanks_raw_count,
+                   iso_blanks_bar_RA, align = "v", axis = "lr", nrow = 2, rel_heights = c(0.25, 0.75))
+
+
+#reorder the isolations so that V1 and V2 isolation blanks are next to one another
+ps_iso_blank_RA@sam_data$iso_sample_type <- ifelse(ps_iso_blank_RA@sam_data$iso_run_nr %in% c(1,3,4,5,6), "Pre-discharge", "Meconium")
+ps_iso_blank_raw@sam_data$iso_sample_type <- ifelse(ps_iso_blank_raw@sam_data$iso_run_nr %in% c(1,3,4,5,6), "Pre-discharge", "Meconium")
+
+iso_blanks_bar_RA2 <- ps_iso_blank_RA %>%
+  create_bar_revleg2(., n = 20, ncol_legend = 2, id="sample_id2") +
+    theme(legend.position = "right", strip.text = element_text(size=12, color="black"), strip.background = element_rect(
+     color="black", fill="white", size=1, linetype="solid")) + ggforce::facet_row(vars(iso_sample_type), scales = "free", space = "free")
+
+#ps_iso_blank_raw@sam_data$iso_sample_type <- ifelse(ps_iso_blank_raw@sam_data$iso_run_nr %in% c(1,3,4,5,6), "Pre-discharge", "Meconium")
+
+iso_blanks_raw_count2 <- ps_iso_blank_raw %>%
+  meta_to_df() %>%
+  ggplot(aes(x = sample_id, y = raw_reads)) +
+    geom_col() +
+    geom_text(aes(label = scales::comma(raw_reads, accuracy = 1)),  angle = 90, color = "white", hjust = 1, size = 2.5, nudge_y = -0.2) + 
+    #theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    theme_bw(base_size=12) + theme(axis.text.x = element_blank(), strip.text = element_text(size=12, color="black"), strip.background = element_rect(
+     color="black", fill="white", size=1, linetype="solid")) +
+    scale_y_log10(labels = scales::comma) +
+    labs(x = "", y = "Raw read count") + ggforce::facet_row(vars(iso_sample_type), scales = "free", space = "free")
+
+blankplot <- cowplot::plot_grid(iso_blanks_raw_count2,
+                   iso_blanks_bar_RA2, align = "v", axis = "lr", nrow = 2, rel_heights = c(0.25, 0.75))
+
+blankplot
+
+png(file=here("results", "figures", "iso_blanks_figure.png"), width = 11, height = 6, units = "in",res=300)
+print(blankplot)
+dev.off()
+
+
+#make it without the axis text (sample names)
+iso_blanks_bar_RA3 <- ps_iso_blank_RA %>%
+  create_bar_revleg2(., n = 20, ncol_legend = 2, id="sample_id2") +
+    theme(legend.position = "right", strip.text = element_text(size=12, color="black"), strip.background = element_rect(
+     color="black", fill="white", size=1, linetype="solid"), axis.text.x = element_blank()) + ggforce::facet_row(vars(iso_sample_type), scales = "free", space = "free")
+
+blankplot2 <- cowplot::plot_grid(iso_blanks_raw_count2,
+                   iso_blanks_bar_RA3, align = "v", axis = "lr", nrow = 2, rel_heights = c(0.25, 0.75))
+
+blankplot2
+
+png(file=here("results", "figures", "iso_blanks_figure_nosamplenames.png"), width = 11, height = 6, units = "in",res=300)
+print(blankplot2)
+dev.off()
+
+
+```
+
+Put all control sample figures in one
+
+```{r all_controls}
+
+all_controls <- ggarrange(iso_blanks_bar_RA3, all_mocks_fig, nrow=2, common.legend = F, labels = c("A", "B"))
+
+all_controls
+
+png(file=here("results", "figures", "all_controls.png"), width = 11, height = 8, units = "in",res=300)
+print(all_controls)
+dev.off()
+
+
+```
+
+V2 isolations nr: 1, 3, 4, 5, 6
+V1 isolations nr: all the other ones.
+For me it seems that the Pseudomonas 12 is less present in V2 sample isolations.
+But in iso_5 there is still a lot of Pseudomonas 12
+However, decontam is not meant for dealing with cross-contamination.
+One option would also be to include batch effect, but we only have one blank per extraction, the PCR plates had combined V1 and V2 samples, and all samples were sequenced in the same run, so probably don't need to include batch effect.
+
+
+```{r pcr_blanks, w = 8, h = 5.5, ow='80%'}
+
+pcr_blanks_bar_RA <- ps_pcr_blank_RA %>%
+  create_bar(., n = 15, ncol_legend = 2) +
+    theme(legend.position = "right")
+
+pcr_blanks_raw_count <- ps_pcr_blank_raw %>%
+  meta_to_df() %>%
+  ggplot(aes(x = sample_id, y = raw_reads)) +
+    geom_col() +
+    geom_text(aes(label = scales::comma(raw_reads, accuracy = 1)),  angle = 90, color = "white", hjust = 1, size = 2.5, nudge_y = -0.2) + 
+    #theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    theme(axis.text.x = element_blank()) +
+    scale_y_log10(labels = scales::comma) +
+    labs(x = "", y = "Raw read count")
+
+cowplot::plot_grid(pcr_blanks_raw_count,
+                   pcr_blanks_bar_RA, align = "v", axis = "lr", nrow = 2, rel_heights = c(0.25, 0.75))
+```
+
+# decontam
+More info in this tutorial: https://benjjneb.github.io/decontam/vignettes/decontam_intro.html
+
+## Select data
+Select only biological samples and blanks (only isolation blanks here). This implies exclusion of mock samples. Also, get rid of any taxa which are non-abundant.
+
+```{r}
+ps_raw_decontam_full <- ps$raw %>%
+  subset_samples(sample_type == "sample" | sample_type == "iso_blank") %>% #only keep biol samples and blanks
+  prune_taxa(!taxa_sums(.) == 0, .) #this gets rid of taxa that are not there anymore
+
+table(ps_raw_decontam_full@sam_data$type_timepoint)
+
+ntaxa(ps_raw_decontam_full)
+
+```
+
+## Inspect library sizes
+
+```{r lib_size_dot, ow = '60%', w = 6, h = 3.5}
+
+ps_raw_decontam_full %>%
+  meta_to_df() %>%
+  arrange(raw_reads) %>%
+  mutate(index = row_number()) %>%
+  ggplot(aes(x = index, y = raw_reads, color = sample_type)) +
+    geom_point(alpha = 0.2) + 
+    labs(y = "Library size\n(number of reads)")
+
+
+ps_raw_decontam_full %>%
+  meta_to_df() %>%
+  arrange(qpcr_16S_pgul) %>%
+  mutate(index = row_number()) %>%
+  ggplot(aes(x = index, y = qpcr_16S_pgul, color = sample_type)) +
+    geom_point(alpha = 0.2) + 
+    labs(y = "DNA concentration\n(16S qPCR (pg/ul))")
+
+```
+
+There are a few samples that have as low read counts as the isolation blanks
+It is important keep the low-read samples for now, because we want to use those negative controls to help identify contaminants!
+
+I will be using the 16S qPCR data for the decontam as also suggested in the decontam paper: https://microbiomejournal.biomedcentral.com/articles/10.1186/s40168-018-0605-2
+Alternatively can also use picogreen data for this.
+
+## check for missing densities
+
+```{r}
+
+kable(ps_raw_decontam_full %>%
+  meta_to_df() %>%
+  filter(sample_type == "iso_blank") %>%
+  count(is.na(qpcr_16S_pgul)))
+
+```
+We have 16S qPCR data for all the blanks
+
+## Overview of samples: number of samples at different timepoints
+
+```{r}
+kable(ps_raw_decontam_full %>%
+  meta_to_df() %>%
+  count(sample_type, group_timepoint))
+```
+## decontam 
+
+### prep data
+
+```{r prep_decontam}
+
+#creating a variable to let decontam know what is the negative and what is a true sample -> needed for prevalence method
+sample_data(ps_raw_decontam_full) <- ps_raw_decontam_full %>%
+  meta_to_df() %>%
+  mutate(is.neg = if_else(sample_type == "iso_blank", TRUE, FALSE)) %>%
+  column_to_rownames("sample_id") %>%
+  sample_data()
+
+```
+
+### decontam using combined method -> this was the final decision to use in this project
+
+```{r comb_decontam}
+
+contamdf.comb <- isContaminant(ps_raw_decontam_full, method="combined", conc = "qpcr_16S_pgul", neg="is.neg", threshold=0.1)
+head(contamdf.comb)
+table(contamdf.comb$contaminant)
+
+# get contaminants:
+names_contaminants_comb <- contamdf.comb%>%
+  filter(contaminant) %>%
+  rownames()
+length(names_contaminants_comb)
+
+# inspect result:
+kable(contamdf.comb %>% filter(contaminant))
+
+
+```
+
+#### Plot contaminants identified with the combined method
+
+```{r plot_comb_contam}
+
+# plot relative abundance of ASV versus DNA concentration
+plot_freq <- function(OTU_names) {
+  ps_raw_decontam_full %>%
+    to_RA() %>%
+    plot_frequency(OTU_names, conc = "qpcr_16S_pgul", normalize = T) +
+    labs(x = "DNA concentration (pg/ul)", y = "Relative abundance") +
+    scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    theme_bw(base_size=13)
+}
+
+plot_freq(c(names_contaminants_comb[1:16]))
+plot_freq(c(names_contaminants_comb[17:32]))
+plot_freq(c(names_contaminants_comb[33:48]))
+plot_freq(c(names_contaminants_comb[49:64]))
+plot_freq(c(names_contaminants_comb[65:72]))
+
+
+#save these plots with smaller text to make a supplementary figure for the thesis
+png(file=here("results", "figures", "decontam1.png"), width = 15, height = 15, units = "in",res=300)
+plot_freq(c(names_contaminants_comb[1:18]))
+dev.off()
+
+png(file=here("results", "figures", "decontam2.png"), width = 15, height = 15, units = "in",res=300)
+plot_freq(c(names_contaminants_comb[19:36]))
+dev.off()
+
+png(file=here("results", "figures", "decontam3.png"), width = 15, height = 15, units = "in",res=300)
+plot_freq(c(names_contaminants_comb[37:54]))
+dev.off()
+
+png(file=here("results", "figures", "decontam4.png"), width = 15, height = 15, units = "in",res=300)
+plot_freq(c(names_contaminants_comb[55:72]))
+dev.off()
+
+
+```
+
+## My contaminants list (combined method)
+
+```{r my_contamlist}
+
+my_contaminants_list <- names_contaminants_comb
+my_contaminants_list
+length(my_contaminants_list) #number of contaminants
+
+```
+
+## Remove the contaminant taxa and check read counts
+
+```{r remove_contaminants}
+
+#print again first the raw reads
+kable(data.frame(sample_data(ps$raw)) %>% group_by(type_timepoint) %>% summarise(meanreads=mean(raw_reads),
+                                                                           minreads=min(raw_reads),
+                                                                           maxreads=max(raw_reads)))
+
+#remove contaminants
+ps_raw_after_mycontam <- ps_raw_decontam_full  %>%
+  subset_taxa(! taxa_names(ps_raw_decontam_full) %in% my_contaminants_list) 
+
+#how many reads was removed in total
+sum(sample_sums(ps_raw_decontam_full) - sample_sums(ps_raw_after_mycontam))
+
+sample_data(ps_raw_after_mycontam)$decontam_reads <- sample_sums(ps_raw_after_mycontam)
+kable(data.frame(sample_data(ps_raw_after_mycontam)) %>% group_by(type_timepoint) %>% summarise(meanreads=mean(decontam_reads),minreads=min(decontam_reads),maxreads=max(decontam_reads)))
+
+ntaxa(ps_raw_after_mycontam)
+
+#calculate % of reads removed by decontam
+sample_data(ps_raw_after_mycontam)$prop_removed <- 1-(sample_data(ps_raw_after_mycontam)$decontam_reads/sample_data(ps_raw_after_mycontam)$raw_reads)
+
+#make this a factor
+sample_data(ps_raw_after_mycontam)$decontam_80 <- ifelse(sample_data(ps_raw_after_mycontam)$prop_removed>0.8, 1, 0)
+sample_data(ps_raw_after_mycontam)$decontam_70 <- ifelse(sample_data(ps_raw_after_mycontam)$prop_removed>0.7, 1, 0)
+
+#plot the % of contaminating reads over 16S DNA concentration
+conc_propremoved <- ps_raw_after_mycontam %>%
+  meta_to_df() %>%
+  ggplot(aes(x = prop_removed, y = qpcr_16S_pgul)) +
+    geom_point(aes(color=sample_type), fill="white", size=2.5, alpha=0.6) +
+    scale_y_log10(labels = function(x) scales::comma(x, accuracy = 1)) +
+    labs(y = "DNA concentration\n(pg/ul)", x="% of reads removed with decontam") +
+  scale_color_manual(values=c("#C62323", "#018B9E"), labels=c("iso_blank" = "Isolation negative control", "sample" = "Sample"), name="") +
+  theme_bw(base_size=13) + geom_vline(xintercept = 0.7, linetype="dashed") + theme(legend.position = "bottom")
+
+conc_propremoved
+
+#plot the number reads remaining over 16S DNA concentration
+ps_raw_after_mycontam %>%
+  meta_to_df() %>%
+  ggplot(aes(x = decontam_reads, y = qpcr_16S_pgul)) +
+    geom_point(aes(color=sample_type), fill="white", size=2.5, alpha=0.6) +
+    scale_y_log10(labels = function(x) scales::comma(x, accuracy = 1)) +
+    labs(y = "DNA concentration\n(pg/ul)", x="Reads remaining after decontam") +
+  scale_color_manual(values=c("#C62323", "#018B9E"), labels=c("iso_blank" = "Isolation negative control", "sample" = "Sample"), name="") +
+  theme_bw(base_size=13) + geom_vline(xintercept = 5000, linetype="dashed")
+
+#plot number of reads remaining after decontam per sample and colour by the % of reads removed
+
+#70% removed
+ps_raw_after_mycontam %>%
+  subset_samples(sample_type == "sample") %>%
+  meta_to_df() %>%
+  ggplot(aes(x = factor(group_timepoint), y = decontam_reads)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6, aes(color=as.factor(decontam_70))) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    scale_y_continuous(label = scales::comma) +
+    labs(x = "", y = "# reads after decontam") + geom_hline(yintercept = 5000, linetype="dashed") +
+  scale_color_manual(name = "", labels = c("<=70% reads removed", ">70% reads removed"),
+                       values=c("#018B9E", "#DE8668")) + 
+  scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+                              "1_V2" = "Preterm pre-discharge"))
+
+#80% removed
+ps_raw_after_mycontam %>%
+  subset_samples(sample_type == "sample") %>%
+  meta_to_df() %>%
+  ggplot(aes(x = factor(group_timepoint), y = decontam_reads)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6, aes(color=as.factor(decontam_80))) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    scale_y_continuous(label = scales::comma) +
+    labs(x = "", y = "# reads after decontam") + geom_hline(yintercept = 5000, linetype="dashed") +
+  scale_color_manual(name = "", labels = c("<=80% reads removed", ">80% reads removed"), values=c("#018B9E", "#DE8668")) + scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+                              "1_V2" = "Preterm pre-discharge"))
+
+
+#plot the blank profiles again
+
+# convert raw reads to relative abundance
+ps_after_mydecontam_RA <- ps_raw_after_mycontam %>% to_RA
+
+ps_iso_blank_after_mydecontam_RA <- subset_samples(ps_after_mydecontam_RA, sample_type == "iso_blank")
+ps_iso_blank_after_mydecontam <- subset_samples(ps_raw_after_mycontam, sample_type == "iso_blank")
+
+iso_blanks_after_mydecontam_bar_RA <- ps_iso_blank_after_mydecontam_RA %>%
+  create_bar_revleg(., n = 15, ncol_legend = 2, id="sample_id2") +
+    theme(legend.position = "right")
+
+iso_blanks_after_mydecontam_count <- ps_iso_blank_after_mydecontam %>%
+  meta_to_df() %>%
+  ggplot(aes(x = sample_id, y = decontam_reads)) +
+    geom_col() +
+    geom_text(aes(label = scales::comma(decontam_reads, accuracy = 1)),  angle = 90, color = "white", hjust = 1, size = 2.5, nudge_y = -0.2) + 
+    #theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    theme(axis.text.x = element_blank()) +
+    scale_y_log10(labels = scales::comma) +
+    labs(x = "", y = "Read count\nafter decontam")
+
+cowplot::plot_grid(iso_blanks_after_mydecontam_count,
+                   iso_blanks_after_mydecontam_bar_RA, align = "v", axis = "lr", nrow = 2, rel_heights = c(0.25, 0.75))
+
+
+#reorder the isolations so that V1 and V2 isolation blanks are next to one another
+ps_iso_blank_after_mydecontam_RA@sam_data$iso_sample_type <- ifelse(ps_iso_blank_after_mydecontam_RA@sam_data$iso_run_nr %in% c(1,3,4,5,6), "Pre-discharge", "Meconium")
+
+ps_iso_blank_after_mydecontam @sam_data$iso_sample_type <- ifelse(ps_iso_blank_after_mydecontam @sam_data$iso_run_nr %in% c(1,3,4,5,6), "Pre-discharge", "Meconium")
+
+
+iso_blanks_after_mydecontam_bar_RA2 <- ps_iso_blank_after_mydecontam_RA %>%
+  create_bar_revleg2(., n = 15, ncol_legend = 2, id="sample_id2") +
+    theme(legend.position = "right", strip.text = element_text(size=12, color="black"), strip.background = element_rect(
+     color="black", fill="white", size=1, linetype="solid")) + ggforce::facet_row(vars(iso_sample_type), scales = "free", space = "free")
+
+iso_blanks_after_mydecontam_count2 <- ps_iso_blank_after_mydecontam %>%
+  meta_to_df() %>%
+  ggplot(aes(x = sample_id, y = decontam_reads)) +
+    geom_col() +
+    geom_text(aes(label = scales::comma(decontam_reads, accuracy = 1)),  angle = 90, color = "white", hjust = 1, size = 2.5, nudge_y = -0.2) + 
+    #theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    theme(axis.text.x = element_blank(), strip.text = element_text(size=12, color="black"), strip.background = element_rect(
+     color="black", fill="white", size=1, linetype="solid")) +
+    scale_y_log10(labels = scales::comma) +
+    labs(x = "", y = "Read count\nafter decontam") + ggforce::facet_row(vars(iso_sample_type), scales = "free", space = "free")
+
+isoblank_afterdecontam <- cowplot::plot_grid(iso_blanks_after_mydecontam_count2,
+                   iso_blanks_after_mydecontam_bar_RA2, align = "v", axis = "lr", nrow = 2, rel_heights = c(0.25, 0.75))
+
+isoblank_afterdecontam
+
+png(file=here("results", "figures", "iso_blanks_afterdecontam_figure.png"), width = 11, height = 6, units = "in",res=300)
+print(isoblank_afterdecontam)
+dev.off()
+
+```
+
+Now seeing crosscontamination? Some contaminants(?) that still seem to remain are Bosea 195, Aquabacterium 784?
+
+## Plotting examples of cross-contamination
+
+For the discharge sample blanks, in isolation 3 there seems to be quite a lot of Enterobacteriaceae in there. To investigate if this is cross-contamination from samples, let's plot the relative abundances of the bacteria identified in isolation 3
+
+```{r iso_3}
+
+#first subset to samples (and blank) from isolation number 3
+
+ps_iso3_after_mydecontam_RA <- subset_samples(ps_after_mydecontam_RA, iso_run_nr == 3)
+
+ps_iso3_after_mydecontam_RA %>%
+  create_bar_revleg(., n = 20, ncol_legend = 2, id="sample_id2") +
+    theme(legend.position = "right")
+
+
+```
+
+In this plot we can see that the blank has ~60% of abundance of Enterobacteriaceae_5, and 9 samples in the same extraction (43%) also have quite high abundance of this taxa.
+The second most abundant in the blank is Clostridium senso stricto, and again there are around 7 samples that have quite a high abundance of this taxa.
+This is just an illustration of the cross-contaminaion.
+
+We can do the same for all isolations. For example:
+
+Isolation 15
+
+```{r iso_15}
+
+#first subset to samples (and blank) from isolation number 15
+
+ps_iso15_after_mydecontam_RA <- subset_samples(ps_after_mydecontam_RA, iso_run_nr == 15)
+
+ps_iso15_after_mydecontam_RA %>%
+  create_bar_revleg(., n = 20, ncol_legend = 2, id="sample_id2") +
+    theme(legend.position = "right")
+
+
+```
+
+Isolation 1
+
+```{r iso_1}
+
+#first subset to samples (and blank) from isolation number 1
+
+ps_iso1_after_mydecontam_RA <- subset_samples(ps_after_mydecontam_RA, iso_run_nr == 1)
+
+ps_iso1_after_mydecontam_RA %>%
+  create_bar_revleg(., n = 20, ncol_legend = 2, id="sample_id2") +
+    theme(legend.position = "right")
+
+
+```
+
+
+Isolation 8
+
+```{r iso_8}
+
+#first subset to samples (and blank) from isolation number 8
+
+ps_iso8_after_mydecontam_RA <- subset_samples(ps_after_mydecontam_RA, iso_run_nr == 8)
+
+ps_iso8_after_mydecontam_RA %>%
+  create_bar_revleg(., n = 20, ncol_legend = 2, id="sample_id2") +
+    theme(legend.position = "right")
+
+
+```
+
+## Filter rare taxa
+First subset to samples only (i.e. remove the blanks)
+
+The raw OTU table is likely to contain many ASVs that are only represented by one/few reads in few samples. These ultrarare ASVs may not represent biologically meaningful bacteria and keeping them in data can slow your computations down. In order to get rid of those, we apply a shallow abundance/prevalence filter to the data. Here only keep ASVs that have a relative abundance of at least **0.1% in at least 2 samples** (following Subramanian et al. 2014). 
+
+```{r shallow_filtering_samples}
+
+#first subset to samples only and remove taxa with 0 reads
+ps_raw_after_mycontam_samples <- ps_raw_after_mycontam %>%
+  subset_samples(sample_type == "sample") %>%
+  #prune_samples(!sample_sums(.) == 0, .) %>%
+  prune_taxa(taxa_sums(.) > 0, .)
+
+taxa_conf_mycontam <- ps_raw_after_mycontam_samples %>%
+  to_RA %>%
+  filter_taxa(function(x) sum(x > 0.001) >= 2, TRUE) %>%
+  taxa_names
+
+# filter rare ASVs
+ps_raw_mycontam_filt <- prune_taxa(taxa_conf_mycontam, ps_raw_after_mycontam_samples)
+
+# number of ASVs discarded at filtering step
+ntaxa(ps_raw_after_mycontam) #asv-s after decontam
+ntaxa(ps_raw_after_mycontam_samples) #asv-s in biol samples after decontam
+ntaxa(ps_raw_mycontam_filt) #asv-s after filtering out ultra-rare taxa
+
+#how many reads left after the shallow filtering - make a new column for this
+sample_data(ps_raw_mycontam_filt)$filt_reads <- sample_sums(ps_raw_mycontam_filt)
+
+table(sample_data(ps_raw_mycontam_filt)$decontam_70) #8 samples haed >70% of reads removed with decontam
+
+#plot number of reads after decontam and shallow filtering per sample type
+ps_raw_mycontam_filt %>%
+  #subset_samples(sample_type == "sample") %>%
+  meta_to_df() %>%
+  ggplot(aes(x = factor(group_timepoint), y = filt_reads)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6, aes(color=as.factor(decontam_70))) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    scale_y_continuous(label = scales::comma) +
+    labs(x = "", y = "# reads after decontam and shallow filtering") + geom_hline(yintercept = 5000, linetype="dashed") +
+  scale_color_manual(name = "", labels = c("<=70% reads removed", ">70% reads removed"),
+                       values=c("#018B9E", "#DE8668")) + scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+                              "1_V2" = "Preterm pre-discharge"))
+
+#print out some tavles showing the mean number of reads remaining per sample type
+kable(data.frame(sample_data(ps_raw_mycontam_filt)) %>% group_by(type_timepoint) %>% summarise(meanreads=mean(filt_reads),
+                                                                           minreads=min(filt_reads),
+                                                                           maxreads=max(filt_reads)))
+
+kable(data.frame(sample_data(ps_raw_mycontam_filt)) %>% summarise(meanreads=mean(filt_reads),
+                                                                           minreads=min(filt_reads),
+                                                                           maxreads=max(filt_reads)))
+
+#taxa in raw reads as a reminder
+ntaxa(ps$raw)
+
+```
+
+## Investigating remaining taxa for potential contaminants
+
+Above, we investigated the frequency/abundance plots of the contaminants identified by the decontam. Now let's investigate the remaining 201 ASVs for potential contaminants
+
+Investigate those asv-s that were identified as contaminants by Salter et al (https://bmcbiol.biomedcentral.com/articles/10.1186/s12915-014-0087-z#Tab1)
+
+```{r salteretal_contaminants}
+
+#read in the list with the contaminants
+contam_list <- read.table(here("raw_data", "contaminants_salteretal.txt"), header=F)
+head(contam_list)
+contam_list
+
+#take out the names of taxa from the filtered dataset 
+taxalist <- as.data.frame(taxa_names(ps_raw_mycontam_filt))
+taxalist <- taxalist %>% separate(col = "taxa_names(ps_raw_mycontam_filt)", into = c("taxa_name", "index", "index2"), sep="_")
+# 
+contam_taxa_list <- taxalist %>% subset(taxa_name %in% contam_list$V1)
+# 
+kable(contam_taxa_list)
+nrow(contam_taxa_list)
+
+```
+
+This list contains many -onas bacteria: Pseudomonas, Sphingomonas, Comamonas, Roseomonas, Stenotrophomonas
+But also: Bosea, Delftia, Curvibacter, Micrococcus, Acinetobacter, Brevibacterium, Aquabacterium, Cupriavidus, Devosia, Enhydrobacter, Kocuria, Limnobacter, Methylobacterium, Sphingopyxis
+
+Let's investigate the relative abundance plots of these taxa
+
+Also added: comamonadaceae
+Didn’t check the Corynebacterium, Streptococcus and Enterobacter as these are expected commensals in the gut
+
+
+```{r investigate_remaining_contaminants}
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Pseudomonas_39"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Pseudomonas_39) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Pseudomonas_39") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Pseudomonas_39"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Pseudomonas_39) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Pseudomonas_39") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Pseudomonas_119"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Pseudomonas_119) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Pseudomonas_119") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Pseudomonas_119"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Pseudomonas_119) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Pseudomonas_119") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Pseudomonas_239"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Pseudomonas_239) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Pseudomonas_239") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Pseudomonas_239"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Pseudomonas_239) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Pseudomonas_239") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Pseudomonas_288"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Pseudomonas_288) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Pseudomonas_288") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Pseudomonas_288"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Pseudomonas_288) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Pseudomonas_288") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Pseudomonas_333"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Pseudomonas_333) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Pseudomonas_333") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Pseudomonas_333"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Pseudomonas_333) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Pseudomonas_333") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Roseomonas_cervicalis_426"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Roseomonas_cervicalis_426) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Roseomonas_cervicalis_426") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Roseomonas_cervicalis_426"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Roseomonas_cervicalis_426) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Roseomonas_cervicalis_426") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Roseomonas_652"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Roseomonas_652) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Roseomonas_652") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Roseomonas_652"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Roseomonas_652) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Roseomonas_652") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Sphingomonas_364"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Sphingomonas_364) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Sphingomonas_364") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Sphingomonas_364"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Sphingomonas_364) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Sphingomonas_364") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Sphingomonas_koreensis_483"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Sphingomonas_koreensis_483) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Sphingomonas_koreensis_483") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Sphingomonas_koreensis_483"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Sphingomonas_koreensis_483) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Sphingomonas_koreensis_483") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Sphingomonas_499"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Sphingomonas_499) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Sphingomonas_499") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Sphingomonas_499"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Sphingomonas_499) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Sphingomonas_499") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Sphingopyxis_437"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Sphingopyxis_437) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Sphingopyxis_437") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Sphingopyxis_437"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Sphingopyxis_437) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Sphingopyxis_437") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Stenotrophomonas_84"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Stenotrophomonas_84) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Stenotrophomonas_84") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Stenotrophomonas_84"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Stenotrophomonas_84) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Stenotrophomonas_84") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Acinetobacter_291"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Acinetobacter_291) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Acinetobacter_291") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Acinetobacter_291"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Acinetobacter_291) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Acinetobacter_291") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Acinetobacter_309"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Acinetobacter_309) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Acinetobacter_309") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Acinetobacter_309"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Acinetobacter_309) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Acinetobacter_309") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Acinetobacter_lwoffii_324"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Acinetobacter_lwoffii_324) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Acinetobacter_lwoffii_324") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Acinetobacter_lwoffii_324"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Acinetobacter_lwoffii_324) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Acinetobacter_lwoffii_324") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Acinetobacter_373"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Acinetobacter_373) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Acinetobacter_373") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Acinetobacter_373"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Acinetobacter_373) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Acinetobacter_373") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Aquabacterium_465"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Aquabacterium_465) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Aquabacterium_465") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Aquabacterium_465"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Aquabacterium_465) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Aquabacterium_465") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Bacillus_107"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Bacillus_107) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Bacillus_107") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Bacillus_107"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Bacillus_107) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Bacillus_107") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Bosea_195"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Bosea_195) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Bosea_195") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Bosea_195"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Bosea_195) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Bosea_195") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Brevibacterium_464"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Brevibacterium_464) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Brevibacterium_464") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Brevibacterium_464"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Brevibacterium_464) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Brevibacterium_464") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Comamonas_365"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Comamonas_365) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Comamonas_365") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Comamonas_365"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Comamonas_365) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Comamonas_365") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Comamonadaceae_306"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Comamonadaceae_306) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Comamonadaceae_306") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Comamonadaceae_306"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Comamonadaceae_306) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Comamonadaceae_306") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Cupriavidus_466"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Cupriavidus_466) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Cupriavidus_466") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Cupriavidus_466"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Cupriavidus_466) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Cupriavidus_466") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Cupriavidus_556"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Cupriavidus_556) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Cupriavidus_556") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Cupriavidus_556"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Cupriavidus_556) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Cupriavidus_556") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Curvibacter_279"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Curvibacter_279) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Curvibacter_279") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Curvibacter_279"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Curvibacter_279) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Curvibacter_279") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Delftia_263"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Delftia_263) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Delftia_263") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Delftia_263"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Delftia_263) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Delftia_263") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Devosia_453"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Devosia_453) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Devosia_453") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Devosia_453"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Devosia_453) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Devosia_453") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Enhydrobacter_534"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Enhydrobacter_534) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Enhydrobacter_534") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Enhydrobacter_534"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Enhydrobacter_534) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Enhydrobacter_534") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Kocuria_395"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Kocuria_395) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Kocuria_395") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Kocuria_395"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Kocuria_395) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Kocuria_395") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Limnobacter_thiooxidans_516"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Limnobacter_thiooxidans_516) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Limnobacter_thiooxidans_516") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Limnobacter_thiooxidans_516"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Limnobacter_thiooxidans_516) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Limnobacter_thiooxidans_516") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Methylobacterium_Methylorubrum_434"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Methylobacterium_Methylorubrum_434) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Methylobacterium_Methylorubrum_434") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Methylobacterium_Methylorubrum_434"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Methylobacterium_Methylorubrum_434) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Methylobacterium_Methylorubrum_434") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Methylobacterium_Methylorubrum_563"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Methylobacterium_Methylorubrum_563) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Methylobacterium_Methylorubrum_563") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Methylobacterium_Methylorubrum_563"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Methylobacterium_Methylorubrum_563) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Methylobacterium_Methylorubrum_563") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Micrococcus_281"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Micrococcus_281) %>%
+  mutate(group_timepoint = fct_explicit_na(group_timepoint, "B") %>% fct_relevel(., "0_V1", "1_V1", "1_V2", "B")) %>%
+  ggplot(aes(x = group_timepoint, y = RA)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  #ggforce::facet_row(~ factor(ASV), space = "free") +
+  labs(y = "Relative abundance Micrococcus_281") + facet_wrap(~iso_run_nr)
+
+ps_raw_decontam_full %>%
+  to_RA() %>%
+  prune_taxa(str_detect(taxa_names(.), "Micrococcus_281"), .) %>%
+  ps_to_df() %>%
+  pivot_longer(names_to = "ASV", values_to = "RA", Micrococcus_281) %>%
+  ggplot(aes(x = qpcr_16S_pgul, y = RA, color=sample_type)) +
+    geom_point(size=2.5, alpha=0.6) +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45), axis.title.y = ggtext::element_markdown()) +
+  labs(y = "Relative abundance Micrococcus_281") + 
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    #scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                  #labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_wrap(~iso_run_nr)
+
+```
+
+Create a list of the bacteria which are additional contaminants
+
+```{r extra_contaminants}
+
+my_extra_contaminants <- c("Pseudomonas_39", "Pseudomonas_239", "Pseudomonas_288", 
+                           "Pseudomonas_333", "Roseomonas_cervicalis_426", "Sphingomonas_364",
+                           "Sphingomonas_koreensis_483", "Sphingomonas_499", "Sphingopyxis_437",
+                           "Acinetobacter_291", "Acinetobacter_309", "Acinetobacter_lwoffii_324",
+                           "Acinetobacter_373", "Aquabacterium_465", "Bosea_195",
+                           "Brevibacterium_464", "Comamonadaceae_306", "Cupriavidus_466",
+                           "Curvibacter_279", "Delftia_263", "Devosia_453", "Enhydrobacter_534",
+                           "Kocuria_395", "Limnobacter_thiooxidans_516", 
+                           "Methylobacterium_Methylorubrum_434", "Methylobacterium_Methylorubrum_563",
+                           "Micrococcus_281")
+
+my_contaminants_list2 <- c(my_contaminants_list, my_extra_contaminants)
+
+```
+
+
+Now will need to go back to the original phyloseq object to remove contaminants and redo the other steps
+
+## Remove the contaminant taxa and the extra contaminants, and check read counts, plot blanks etc
+
+```{r remove_contaminants2}
+
+#print again first the raw reads
+kable(data.frame(sample_data(ps$raw)) %>% group_by(type_timepoint) %>% summarise(meanreads=mean(raw_reads),
+                                                                           minreads=min(raw_reads),
+                                                                           maxreads=max(raw_reads)))
+
+#remove the contaminant taxa
+ps_raw_after_mycontam_extra <- ps_raw_decontam_full  %>%
+  subset_taxa(!taxa_names(ps_raw_decontam_full) %in% my_contaminants_list2)
+
+#how many reads were removed compared to original number of reads
+sum(sample_sums(ps_raw_decontam_full) - sample_sums(ps_raw_after_mycontam_extra))
+
+sample_data(ps_raw_after_mycontam_extra)$decontam_reads_extra <- sample_sums(ps_raw_after_mycontam_extra)
+kable(data.frame(sample_data(ps_raw_after_mycontam_extra)) %>% group_by(type_timepoint) %>% summarise(meanreads=mean(decontam_reads_extra),minreads=min(decontam_reads_extra),maxreads=max(decontam_reads_extra)))
+
+ntaxa(ps_raw_after_mycontam_extra)
+
+#calculate % of reads removed by decontam and removing the extra contaminants
+sample_data(ps_raw_after_mycontam_extra)$prop_removed_extra <- 1-(sample_data(ps_raw_after_mycontam_extra)$decontam_reads_extra/sample_data(ps_raw_after_mycontam_extra)$raw_reads)
+
+#make this a factor
+sample_data(ps_raw_after_mycontam_extra)$decontam_extra_80 <- ifelse(sample_data(ps_raw_after_mycontam_extra)$prop_removed_extra>0.8, 1, 0)
+sample_data(ps_raw_after_mycontam_extra)$decontam_extra_70 <- ifelse(sample_data(ps_raw_after_mycontam_extra)$prop_removed_extra>0.7, 1, 0)
+
+table(sample_data(ps_raw_after_mycontam_extra)$decontam_extra_70, sample_data(ps_raw_after_mycontam_extra)$sample_type)
+table(sample_data(ps_raw_after_mycontam_extra)$decontam_extra_80, sample_data(ps_raw_after_mycontam_extra)$sample_type)
+#still the same 8 samples that have 70% of reads removed
+
+#plot the % of contaminating reads over 16S DNA concentration
+ps_raw_after_mycontam_extra %>%
+  meta_to_df() %>%
+  ggplot(aes(x = prop_removed_extra, y = qpcr_16S_pgul)) +
+    geom_point(aes(color=sample_type), fill="white", size=2.5, alpha=0.6) +
+    scale_y_log10(labels = function(x) scales::comma(x, accuracy = 1)) +
+    labs(y = "DNA concentration\n(pg/ul)", x="% of reads removed with decontam and additional contaminants") +
+  scale_color_manual(values=c("#C62323", "#018B9E"), labels=c("iso_blank" = "Isolation negative control", "sample" = "Sample"), name="") +
+  theme_bw(base_size=13) + geom_vline(xintercept = 0.7, linetype="dashed")
+
+#plot the number reads remaining over 16S DNA concentration
+ps_raw_after_mycontam_extra %>%
+  meta_to_df() %>%
+  ggplot(aes(x = decontam_reads_extra, y = qpcr_16S_pgul)) +
+    geom_point(aes(color=sample_type), fill="white", size=2.5, alpha=0.6) +
+    scale_y_log10(labels = function(x) scales::comma(x, accuracy = 1)) +
+    labs(y = "DNA concentration\n(pg/ul)", x="Reads remaining after decontam and removing additional contaminants") +
+  scale_color_manual(values=c("#C62323", "#018B9E"), labels=c("iso_blank" = "Isolation negative control", "sample" = "Sample"), name="") +
+  theme_bw(base_size=13) + geom_vline(xintercept = 5000, linetype="dashed")
+
+#plot number of reads remaining after decontam
+noreads_decontam_extrafilter <- ps_raw_after_mycontam_extra %>%
+  subset_samples(sample_type == "sample") %>%
+  meta_to_df() %>%
+  ggplot(aes(x = factor(group_timepoint), y = decontam_reads_extra)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6, aes(color=as.factor(decontam_extra_70))) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    scale_y_continuous(label = scales::comma) +
+    labs(x = "", y = "Number of reads after\ndecontam and removing extra contaminants") + geom_hline(yintercept = 5000, linetype="dashed") +
+  scale_color_manual(name = "", labels = c("<=70% reads removed", ">70% reads removed"),
+                       values=c("#018B9E", "#FFA32F")) + scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+                              "1_V2" = "Preterm pre-discharge")) + theme_bw(base_size = 13) + theme(legend.position = "bottom")
+
+noreads_decontam_extrafilter
+
+ps_raw_after_mycontam_extra %>%
+  subset_samples(sample_type == "sample") %>%
+  meta_to_df() %>%
+  ggplot(aes(x = factor(group_timepoint), y = decontam_reads_extra)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6, aes(color=as.factor(decontam_extra_80))) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    scale_y_continuous(label = scales::comma) +
+    labs(x = "", y = "# reads after decontam and removing extra contaminants") + geom_hline(yintercept = 5000, linetype="dashed") +
+  scale_color_manual(name = "", labels = c("<=80% reads removed", ">80% reads removed"),
+                       values=c("#018B9E", "#DE8668")) +
+  scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+                              "1_V2" = "Preterm pre-discharge"))
+
+
+#plot the blank profiles again
+
+# convert raw reads to relative abundance
+ps_raw_after_mycontam_extra_RA <- ps_raw_after_mycontam_extra %>% to_RA
+
+ps_iso_blank_after_mydecontam_extra_RA <- subset_samples(ps_raw_after_mycontam_extra_RA, sample_type == "iso_blank")
+ps_iso_blank_after_mydecontam_extra <- subset_samples(ps_raw_after_mycontam_extra, sample_type == "iso_blank")
+
+iso_blanks_after_mydecontam_extra_bar_RA <- ps_iso_blank_after_mydecontam_extra_RA %>%
+  create_bar(., n = 15, ncol_legend = 2, id="sample_id2") +
+    theme(legend.position = "right")
+
+iso_blanks_after_mydecontam_extra_count <- ps_iso_blank_after_mydecontam_extra %>%
+  meta_to_df() %>%
+  ggplot(aes(x = sample_id, y = decontam_reads_extra)) +
+    geom_col() +
+    geom_text(aes(label = scales::comma(decontam_reads_extra, accuracy = 1)),  angle = 90, color = "white", hjust = 1, size = 2.5, nudge_y = -0.2) + 
+    #theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    theme(axis.text.x = element_blank()) +
+    scale_y_log10(labels = scales::comma) +
+    labs(x = "", y = "Read count\nafter decontam+\nremoving extra\ncontaminants")
+
+cowplot::plot_grid(iso_blanks_after_mydecontam_extra_count,
+                   iso_blanks_after_mydecontam_extra_bar_RA, align = "v", axis = "lr", nrow = 2, rel_heights = c(0.25, 0.75))
+
+
+#reorder the isolations so that V1 and V2 isolation blanks are next to one another
+ps_iso_blank_after_mydecontam_extra_RA@sam_data$iso_sample_type <- ifelse(ps_iso_blank_after_mydecontam_extra_RA@sam_data$iso_run_nr %in% c(1,3,4,5,6), "Pre-discharge", "Meconium")
+
+ps_iso_blank_after_mydecontam_extra@sam_data$iso_sample_type <- ifelse(ps_iso_blank_after_mydecontam_extra@sam_data$iso_run_nr %in% c(1,3,4,5,6), "Pre-discharge", "Meconium")
+
+
+iso_blanks_after_mydecontam_extra_bar_RA2 <- ps_iso_blank_after_mydecontam_extra_RA %>%
+  create_bar_revleg2(., n = 15, ncol_legend = 2, id="sample_id2") +
+    theme(legend.position = "right", strip.text = element_text(size=12, color="black"), strip.background = element_rect(
+     color="black", fill="white", size=1, linetype="solid")) + ggforce::facet_row(vars(iso_sample_type), scales = "free", space = "free")
+
+iso_blanks_after_mydecontam_extra_count2 <- ps_iso_blank_after_mydecontam_extra %>%
+  meta_to_df() %>%
+  ggplot(aes(x = sample_id, y = decontam_reads_extra)) +
+    geom_col() +
+    geom_text(aes(label = scales::comma(decontam_reads_extra, accuracy = 1)),  angle = 90, color = "white", hjust = 1, size = 2.5, nudge_y = -0.2) + 
+    #theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    theme(axis.text.x = element_blank(), strip.text = element_text(size=12, color="black"), strip.background = element_rect(
+     color="black", fill="white", size=1, linetype="solid")) +
+    scale_y_log10(labels = scales::comma) +
+    labs(x = "", y = "Read count\nafter decontam+\nremoving extra\ncontaminants") + ggforce::facet_row(vars(iso_sample_type), scales = "free", space = "free")
+
+isoblank_afterdecontam_extra <- cowplot::plot_grid(iso_blanks_after_mydecontam_extra_count2,
+                   iso_blanks_after_mydecontam_extra_bar_RA2, align = "v", axis = "lr", nrow = 2, rel_heights = c(0.25, 0.75))
+
+isoblank_afterdecontam_extra
+
+png(file=here("results", "figures", "iso_blanks_afterdecontam_extra_figure_update.png"), width = 11, height = 6, units = "in",res=300)
+print(isoblank_afterdecontam_extra)
+dev.off()
+
+```
+
+
+Mesorhizobium is also a potential contaminant, but this gets removed when excluding all blanks from the dataset so don't need to worry about it
+
+## Save the phyloseq object for calculating alpha diversity
+It is important to calculate measures of alpha diversity before removing ultrarare species to get accurate estimations
+I will calculate:
+- Shannon index that combines richness and eveness
+- Observed species as a measure of microbial richness
+- Chao1 as an additional measure of microbial richness
+
+First subset to samples only (i.e. remove the blanks)
+
+
+```{r alpha_diversity}
+
+#save the phyloseq object where contaminants have been removed but shallow filtering not yet performed
+sl(ps_contaminantsremoved_nonfiltered, ps_raw_after_mycontam_extra, overwrite = T, dir_path = here("processed_data", "qc_decontam"))
+
+```
+
+## Filter rare taxa
+The raw OTU table is likely to contain many ASVs that are only represented by one/few reads in few samples. These ultrarare ASVs may not represent biologically meaningful bacteria and keeping them in data can slow your computations down. In order to get rid of those, we apply a shallow abundance/prevalence filter to the data. Here only keep ASVs that have a relative abundance of at least **0.1% in at least 2 samples** (following Subramanian et al. 2014). 
+
+```{r shallow_filtering_samples_2}
+
+#first subset to samples only and remove taxa that are not present in any of the samples
+ps_raw_after_mycontam_extra_samples <- ps_raw_after_mycontam_extra %>%
+  subset_samples(sample_type == "sample") %>%
+  #prune_samples(!sample_sums(.) == 0, .) %>% #for some reason this doesn't work
+  prune_taxa(taxa_sums(.) > 0, .)
+
+#check number of samples and taxa
+nrow(sample_data(ps_raw_after_mycontam_extra_samples))
+ntaxa(ps_raw_after_mycontam_extra_samples)
+table(sample_data(ps_raw_after_mycontam_extra_samples)$group_timepoint)
+ntaxa(ps_raw_after_mycontam_extra)
+
+#check number of reads again
+sample_data(ps_raw_after_mycontam_extra_samples)$sample_reads <- sample_sums(ps_raw_after_mycontam_extra_samples)
+kable(data.frame(sample_data(ps_raw_after_mycontam_extra_samples)) %>% group_by(type_timepoint) %>% summarise(meanreads=mean(sample_reads),
+                                                                           minreads=min(sample_reads),
+                                                                           maxreads=max(sample_reads)))
+
+taxa_conf_mycontam_extra <- ps_raw_after_mycontam_extra_samples %>%
+  to_RA %>%
+  filter_taxa(function(x) sum(x > 0.001) >= 2, TRUE) %>%
+  taxa_names
+
+# filter rare ASVs
+ps_raw_mycontam_extra_filt <- prune_taxa(taxa_conf_mycontam_extra, ps_raw_after_mycontam_extra_samples)
+
+# number of ASVs discarded at filtering step
+ntaxa(ps_raw_after_mycontam_extra)
+ntaxa(ps_raw_after_mycontam_extra_samples)
+ntaxa(ps_raw_mycontam_extra_filt) 
+
+sample_data(ps_raw_mycontam_extra_filt)$filt_reads <- sample_sums(ps_raw_mycontam_extra_filt)
+
+table(sample_data(ps_raw_mycontam_extra_filt)$decontam_extra_70)
+
+#plot number of reads per sample type
+ps_raw_mycontam_extra_filt %>%
+  #subset_samples(sample_type == "sample") %>%
+  meta_to_df() %>%
+  ggplot(aes(x = factor(group_timepoint), y = filt_reads)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6, aes(color=as.factor(decontam_extra_70))) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    scale_y_continuous(label = scales::comma) +
+    labs(x = "", y = "# reads after decontam, removing extra contaminants\n and shallow filtering") + geom_hline(yintercept = 5000, linetype="dashed") +
+  geom_hline(yintercept = 3000, linetype="dashed")  + geom_hline(yintercept = 10000, linetype="dashed") +
+  scale_color_discrete(name = "", labels = c("<=70% reads removed", ">70% reads removed")) + scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+                              "1_V2" = "Preterm pre-discharge"))
+
+#same but prettier
+noreads_decontam_extrafilter_shallowfilter <- ps_raw_mycontam_extra_filt %>%
+  #subset_samples(sample_type == "sample") %>%
+  meta_to_df() %>%
+  ggplot(aes(x = factor(group_timepoint), y = filt_reads)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6, aes(color=as.factor(decontam_extra_70))) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) +
+    scale_y_continuous(label = scales::comma) +
+    labs(x = "", y = "Number reads after decontam,\nremoving extra contaminants\nand shallow filtering") + geom_hline(yintercept = 5000, linetype="dashed") +
+  scale_color_manual(name = "", labels = c("<=70% reads removed", ">70% reads removed"),
+                       values=c("#018B9E", "#FFA32F")) + scale_x_discrete(labels=c("0_V1" = "Term\nmeconium", "1_V1" = "Preterm\nmeconium",
+                              "1_V2" = "Preterm\npre-discharge")) + theme_bw(base_size = 13) + theme(legend.position = "bottom")
+
+noreads_decontam_extrafilter_shallowfilter
+
+
+kable(data.frame(sample_data(ps_raw_mycontam_extra_filt)) %>% group_by(type_timepoint) %>% summarise(meanreads=mean(filt_reads),
+                                                                           minreads=min(filt_reads),
+                                                                           maxreads=max(filt_reads)))
+
+#taxa in raw reads as a reminder
+ntaxa(ps$raw)
+
+```
+
+# Make a joint QC plot demonstrating # of reads removed with decontam and extra contaminant filtering
+
+```{r qc_plot}
+
+qc_readplot <- ggarrange(conc_propremoved, noreads_decontam_extrafilter_shallowfilter, ncol=2, labels = c("A", "B"))
+
+png(file=here("results", "figures", "qc_readplot.png"), width = 10, height = 6, units = "in",res=300)
+print(qc_readplot)
+dev.off()
+
+```
+
+## Inspect low read samples
+
+in 4 samples more than 80% of reads were removed with decontam, these are all with <3000 reads after filtering
+And all the 8 samples with <3000 reads had 70% of reads removed with decontam
+
+```{r inspect_lowreads}
+
+ps_lowreads <- ps_raw_mycontam_extra_filt %>% subset_samples(filt_reads <5000)
+#maximum reads in these samples
+max(ps_lowreads@sam_data$filt_reads)
+#what % of reads removed during decontam
+max(ps_lowreads@sam_data$prop_removed)
+min(ps_lowreads@sam_data$prop_removed)
+
+#plot profiles
+#first create the relative abundance phyloseq object
+ps_raw_mycontam_extra_filt_RA <- ps_raw_mycontam_extra_filt %>% to_RA
+#subset to low read samples
+ps_lowreads_RA <- subset_samples(ps_raw_mycontam_extra_filt_RA, filt_reads <5000)
+
+#plot
+lowread_bar_RA <- ps_lowreads_RA %>%
+  create_bar_revleg(., n = 15, ncol_legend = 2, id="sample_id2") +
+    theme(legend.position = "right")
+
+lowread_count <- ps_lowreads %>%
+  meta_to_df() %>%
+  ggplot(aes(x = sample_id2, y = filt_reads)) +
+    geom_col() +
+    geom_text(aes(label = scales::comma(filt_reads, accuracy = 1)),  angle = 90, color = "white", hjust = 1, size = 2.5, nudge_y = -0.2) + 
+    #theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    theme(axis.text.x = element_blank()) +
+    scale_y_log10(labels = scales::comma) +
+    labs(x = "", y = "Read count\nafter decontam,\nremoval of\nextra contaminants\nand shallow filter")
+
+lowread_sample_plot <- cowplot::plot_grid(lowread_count,
+                   lowread_bar_RA, align = "v", axis = "lr", nrow = 2, rel_heights = c(0.25, 0.75))
+
+lowread_sample_plot
+
+png(file=here("results", "figures", "lowread_samples_figure.png"), width = 10, height = 7, units = "in",res=300)
+print(lowread_sample_plot)
+dev.off()
+
+```
+
+
+## Inspect duplicate samples
+There are a few infants for whom two samples were collected per timepoint. These have '_s' in the name.
+
+```{r duplicate_samples}
+
+#take out only the duplicate samples to inspect them
+
+duplicates <- ps_raw_mycontam_extra_filt %>%
+  subset_samples(str_detect(sample_id2, "_s"))
+
+#inspect profiles and numbers of reads
+duplicates_RA <- subset_samples(ps_raw_mycontam_extra_filt_RA, str_detect(sample_id2, "_s"))
+
+duplicates_bar_RA <- duplicates_RA %>%
+  create_bar_revleg(., n = 15, ncol_legend = 2, id="sample_id2") +
+    theme(legend.position = "right")
+
+duplicates_count <- duplicates %>%
+  meta_to_df() %>%
+  ggplot(aes(x = sample_id2, y = filt_reads)) +
+    geom_col() +
+    geom_text(aes(label = scales::comma(filt_reads, accuracy = 1)),  angle = 90, color = "white", hjust = 1, size = 2.5, nudge_y = -0.2) + 
+    #theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    theme(axis.text.x = element_blank()) +
+    scale_y_log10(labels = scales::comma) +
+    labs(x = "", y = "Read count")
+
+cowplot::plot_grid(duplicates_count,
+                   duplicates_bar_RA, align = "v", axis = "lr", nrow = 2, rel_heights = c(0.25, 0.75))
+
+
+```
+
+Overall the duplicate samples have very similar profiles although the read counts can be a bit different.
+
+Also inspect the metadata for those samples:
+
+```{r duplicate_samples_metadata}
+
+duplicates@sam_data
+
+```
+
+8447: both collected on the same day, _s1 is 2nd pass and _s2 is third pass of meconium -> will keep the second pass (_s1) as it is earlier.
+8034 discharge duplicate: keep _s2 as it is both collected later (i.e. closer to leaving hospital) and has higher read count.
+8049: These samples are also collected on the same day -> will keep _s2 as it has slightly higher read count
+8070: discharge stool, both collected at the same day -> will keep _s1 as it has higher read count
+
+## Remove samples based on low read count (these are also those where >70% of reads were removed during decontam) as well as duplicates 
+
+```{r remove_duplicates_lowreads}
+
+ ps_final <- ps_raw_mycontam_extra_filt %>%
+  subset_samples(!str_detect(sample_id2, "TW_03_8447_V1_s2|TW_03_8034_V2_s1|TW_03_8049_V2_s1|TW_03_8070_V2_s2")) %>%
+  subset_samples(!(filt_reads <5000)) %>%
+  prune_samples(!sample_sums(.) == 0, .)
+
+#final number of taxa
+ntaxa(ps_final)
+#final number of subjects
+nrow(ps_final@sam_data)
+
+meta_final <- ps_final@sam_data
+length(unique(meta_final$record_id))
+table(meta_final$Visit_number, meta_final$preterm)
+
+kable(data.frame(sample_data(ps_final)) %>% group_by(type_timepoint) %>% summarise(meanreads=mean(filt_reads),
+                                                                           minreads=min(filt_reads),
+                                                                           maxreads=max(filt_reads)))
+
+kable(data.frame(sample_data(ps_final)) %>% summarise(meanreads=mean(filt_reads),
+                                                                           minreads=min(filt_reads),
+                                                                           maxreads=max(filt_reads)))
+
+#calculate % of total reads removed
+sample_data(ps_final)$prop_total_removed_reads <- 1-(sample_data(ps_final)$filt_reads/sample_data(ps_final)$raw_reads)
+
+kable(data.frame(sample_data(ps_final)) %>% summarise(meanremoved=mean(prop_total_removed_reads),
+                                                                           minremoved=min(prop_total_removed_reads),
+                                                                           maxremoved=max(prop_total_removed_reads)))
+
+# check number of raw reads per sample after filtering
+data.frame(raw_counts=otu_table(ps_final) %>% colSums) %>%
+  ggplot(aes(x=raw_counts)) +
+  geom_histogram(binwidth = 1000)
+
+
+ps_final %>%
+  #subset_samples(sample_type == "sample") %>%
+  meta_to_df() %>%
+  ggplot(aes(x = factor(group_timepoint), y = filt_reads)) +
+    geom_jitter(width = 0.2, size=2.5, alpha=0.6, aes(color=group_timepoint)) +
+    geom_boxplot(alpha=0.5, outlier.colour = NA) + scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3"), labels=c("Term meconium", "Preterm meconium", "Preterm pre-discharge"), name="") +
+    scale_y_continuous(label = scales::comma) + theme_bw(base_size=13) +
+    labs(x = "", y = "Final number of reads") + scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+                              "1_V2" = "Preterm pre-discharge")) + theme(legend.position = "none")
+
+#convert to relative abundances
+ps_final_RA <- ps_final %>% to_RA
+
+#print out the taxa names
+final_taxa2 <- rownames(ps_final@otu_table)
+final_taxa2
+
+
+
+```
+
+# Write enviroment to use the filtered phyloseq objects later
+
+```{r}
+sl(ps_final, ps_final, overwrite = T, dir_path = here("processed_data", "qc_decontam"))
+sl(ps_final_RA, ps_final_RA, overwrite = T, dir_path = here("processed_data", "qc_decontam"))
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```

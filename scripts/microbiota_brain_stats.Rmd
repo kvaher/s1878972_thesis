@@ -1,0 +1,1340 @@
+---
+title: "TEBC pre-discharge faecal samples: microbiota associations with brain imaging markers: global approach"
+author: 
+  - "Kadi Vaher"
+date: '`r Sys.Date()`'
+output: html_document
+---
+
+```{r setup, include=F, message=F}
+
+library(tidyverse) 
+library(here) 
+library(RColorBrewer)
+library(knitr)
+library(ggpubr)
+library(vegan)
+library(ggrepel)
+library(ape)
+library(Hmisc)
+library(corrplot)
+library(car)
+
+# set paths
+knitr::opts_knit$set(root.dir=".", aliases=c(h = "fig.height", w = "fig.width", ow = "out.width"))
+knitr::opts_chunk$set(dev = c('png'), 
+                      fig.path = here("results", "figures", "mb_brain_models", "microbiota_brain_stats", ""), dpi = 300)
+theme_set(theme_light()) # global option for ggplot2
+
+```
+
+# Run the whole document - ONLY AT THE END OF THE WORKSTREAM
+
+```{r knit, echo=F, eval=FALSE}
+rmarkdown::render(input = here("scripts", "microbiota_brain_stats.Rmd"), output_dir = here("results", "reports"))
+```
+
+# Load in data
+
+```{r load_data}
+
+tissue_morph <- read.csv(here("imaging_data", "processed_data", "tissues_cortex_morphology_diffusion_TEBC_17102022.csv"))
+gfactors <- read.csv(here("imaging_data", "processed_data", "singlemetric_gfactors_matchingsample.csv"))
+
+demo_matching <- read.csv(here("processed_data", "demographics_microbiome_mri_79_10102022.csv"))
+demo_final_samples <- read.csv(here("processed_data", "demographics_clusterinfo_finalsamples_04102022.csv"))
+
+pcoa <- read.csv(here("processed_data", "matchingsample_pcoa_relativeabundances.csv"))
+
+
+```
+
+# Wrangle data
+
+## Microbiota data
+First need to organise the microbiota data to have all in the same dataframe
+
+```{r all_microbiota}
+
+alpha <- demo_final_samples %>% select(sample_work_nr, Observed_rarefied, Shannon_rarefied)
+
+pcoa <- pcoa %>% rename(sample_work_nr = X)
+
+#merge
+all_microbiota_matching <- merge(alpha, pcoa, by="sample_work_nr", all.y=T)
+
+```
+
+## Brain data
+Now organise the brain data into one dataframe
+
+```{r all_brain}
+
+#subset the tissue morph file to only include the infants with matching microbiota
+tissue_morph <- tissue_morph %>% subset(record_id %in% demo_matching$record_id)
+
+gfactors <- gfactors %>% select(-GA_birth, -GA_mri, -sex)
+
+#merge
+all_brain_matching <- merge(tissue_morph, gfactors, by="record_id", all=T)
+
+#select the columns that I will be using in analyses
+#volumes: raw and relative
+#microstructure: FA, MD and WM or GM optimised NDI, ODI and ISO -> still want to keep NDI and ODI as more specific measures of microstructure; I think especially important for the cortex to reflect cellular density and neurite geometrical complexity
+all_brain_matching <- all_brain_matching %>% select(-WM_FA, -WM_MD, -WM_L1, -WM_RD, -WM_NDI_WM, -WM_ODI_WM, -WM_ISO_WM,
+                                                    -CB_NDI_WM, -CB_ODI_WM, -CB_ISO_WM, -gAD,
+                                                    -contains("MD"), -contains("L1"))
+
+```
+
+## Demographics
+Organise demographics data
+
+```{r org_demo}
+
+#select important demographics info (that will use in models)
+imp_demo <- demo_matching %>% select(record_id, sample_id, sample_work_nr, Time_point, Visit_number, GA_birth, extremely_preterm, postnatal_age_at_sample_d, PMA_sample_w, sex, GA_mri, birthweight_z_score, sepsis_binary, nec_binary, Vaginal_delivery, AB_after72h, BM_75)
+
+
+```
+
+Merge all data into one table
+
+```{r all_data}
+
+all_data <- merge(imp_demo, all_brain_matching, by="record_id")
+
+all_data <- merge(all_data, all_microbiota_matching, by="sample_work_nr")
+
+```
+
+# Statistical analysis
+Residualise the microbiota metrics against PMA at sample
+
+```{r residualise, ow="50%"}
+
+all_data_resid <- all_data %>% mutate(Axis.1_res = resid(lm(scale(Axis.1) ~ scale(PMA_sample_w), data=all_data)),
+                                        Axis.2_res = resid(lm(scale(Axis.2) ~ scale(PMA_sample_w), data=all_data)),
+                                        Axis.3_res = resid(lm(scale(Axis.3) ~ scale(PMA_sample_w), data=all_data)),
+                                        Axis.4_res = resid(lm(scale(Axis.4) ~ scale(PMA_sample_w), data=all_data)),
+                                        Shannon_rarefied_res = resid(lm(scale(Shannon_rarefied) ~ scale(PMA_sample_w), data=all_data)),
+                                        Observed_rarefied_res = resid(lm(scale(Observed_rarefied) ~ scale(PMA_sample_w), data=all_data)))
+
+#look at the distributions of the residuals
+hist(all_data_resid$Axis.1_res)
+hist(all_data_resid$Axis.2_res)
+hist(all_data_resid$Axis.3_res) #this one is maybe a bit skewed, but tried some transformations and did not help at all
+hist(all_data_resid$Axis.4_res)
+hist(all_data_resid$Shannon_rarefied_res)
+hist(all_data_resid$Observed_rarefied_res)
+
+################################################
+
+#GA group and the residualised axes
+
+library(MVN)
+mvn(data = all_data_resid[186:191], univariateTest = "SW", univariatePlot = "histogram")
+
+wilcox.test(Axis.1_res~extremely_preterm, data=all_data_resid)
+ggplot(all_data_resid, aes(x=as.factor(extremely_preterm), y=Axis.1_res)) + geom_boxplot() + geom_jitter(
+  aes(color = as.factor(extremely_preterm)), 
+  position = position_jitter(0.2))
+
+wilcox.test(Axis.2_res~extremely_preterm, data=all_data_resid)
+ggplot(all_data_resid, aes(x=as.factor(extremely_preterm), y=Axis.2_res)) + geom_boxplot() + geom_jitter(
+  aes(color = as.factor(extremely_preterm)), 
+  position = position_jitter(0.2))
+
+wilcox.test(Axis.3_res~extremely_preterm, data=all_data_resid)
+ggplot(all_data_resid, aes(x=as.factor(extremely_preterm), y=Axis.3_res)) + geom_boxplot() + geom_jitter(
+  aes(color = as.factor(extremely_preterm)), 
+  position = position_jitter(0.2))
+
+wilcox.test(Axis.4_res~extremely_preterm, data=all_data_resid)
+ggplot(all_data_resid, aes(x=as.factor(extremely_preterm), y=Axis.4_res)) + geom_boxplot() + geom_jitter(
+  aes(color = as.factor(extremely_preterm)), 
+  position = position_jitter(0.2))
+
+t.test(Shannon_rarefied_res~extremely_preterm, data=all_data_resid)
+ggplot(all_data_resid, aes(x=as.factor(extremely_preterm), y=Shannon_rarefied_res)) + geom_boxplot() + geom_jitter(
+  aes(color = as.factor(extremely_preterm)), 
+  position = position_jitter(0.2))
+
+t.test(Observed_rarefied_res ~extremely_preterm, data=all_data_resid)
+ggplot(all_data_resid, aes(x=as.factor(extremely_preterm), y=Observed_rarefied_res )) + geom_boxplot() + geom_jitter(
+  aes(color = as.factor(extremely_preterm)), 
+  position = position_jitter(0.2))
+
+
+#make a joint figure for the microbiota features and GA group
+ga_fig <- all_data_resid %>% select(record_id, extremely_preterm, Axis.1_res, Axis.2_res, Axis.3_res, Axis.4_res, Shannon_rarefied_res, Observed_rarefied_res)
+
+#melt this dataframe
+library(reshape)
+ga_fig_melt <- melt(ga_fig, id.vars=c("record_id", "extremely_preterm"), measure.vars=3:8, variable_name="Microbiota_feature")
+detach("package:reshape", unload=TRUE)
+
+GA_group_mb_fig <- ggplot(ga_fig_melt, aes(x=as.factor(extremely_preterm), y=value)) +
+  geom_boxplot(outlier.shape = NA, aes(fill=as.factor(extremely_preterm)), alpha=0.2, width=0.5) + 
+  geom_jitter(
+  aes(color = as.factor(extremely_preterm)), 
+  position = position_jitter(0.2)) +
+  #geom_violin(aes(fill=as.factor(extremely_preterm)), alpha=0.2) +
+  scale_fill_manual(values=c("#874B78","#DAA9CD"), name="") +
+  scale_color_manual(values=c("#874B78", "#DAA9CD"), name="") +
+  facet_wrap(~Microbiota_feature, labeller = as_labeller(c("Axis.1_res" = "PCo1", "Axis.2_res" = "PCo2", "Axis.3_res" = "PCo3", "Axis.4_res" = "PCo4", "Shannon_rarefied_res" = "Shannon index", "Observed_rarefied_res" = "Observed species"))) +
+  xlab("GA group") + ylab("Microbiota feature residualised against GA at sample collection") + theme_bw(base_size = 13) +
+  scale_x_discrete(labels=c("0" = "Very\npreterm", "1" = "Extremely\npreterm")) +
+  theme(legend.position = "none", strip.text = element_text(size=12, color="black"), strip.background = element_rect(color="black", fill="white", size=1, linetype="solid"))
+
+GA_group_mb_fig
+
+png(file=here("results", "figures", "microbiotafeatures_GAgroup.png"), width = 6, height =6 , units = "in",res=300)
+print(GA_group_mb_fig)
+dev.off()
+
+
+############################################
+#also do the correlation with ASV abundances figure after residualising
+
+#correlation matrix between the axes and RA of ASVs
+cor_mx_afterresid=cor(all_data_resid[,186:191],all_data_resid[,59:185], method = "spearman")
+
+#transform the correlation matrix and make into a dataframe
+cor_mx_t <- t(cor_mx_afterresid) %>% data.frame()
+source(here("src", "utils_kadi.R"))
+cor_mx_data <- cor_mx_t %>% mutate(ASV=row.names(cor_mx_t)) %>% mutate(ASV_name = format_OTU(ASV))
+
+#put this into long format
+library(reshape)
+cor_mx_data_melt <- melt(cor_mx_data, id.vars = c("ASV", "ASV_name"), measure.vars = 1:4, variable_name="PCo")
+detach("package:reshape", unload=TRUE)
+
+cor_mx_data_melt <- cor_mx_data_melt %>% mutate(pos_neg = ifelse(value<0, "negative", "positive"))
+cor_mx_data_melt$abs_value <- abs(cor_mx_data_melt$value)
+
+a1 <- cor_mx_data_melt %>% subset(PCo=="Axis.1_res") %>% slice_max(abs_value, n=30) %>%
+  ggplot(aes(x=value,y=reorder(ASV_name, -value), fill=pos_neg))+ 
+               geom_bar(stat = "identity" ,width = 0.7) +
+  theme(axis.text.y = ggtext::element_markdown(), legend.position="none") +
+  scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  ylab("ASV") + xlab("Spearman correlation coefficient") +
+  scale_x_continuous(breaks=seq(-0.8,0.8,0.2), limits=c(-0.8, 0.8))
+
+a2 <- cor_mx_data_melt %>% subset(PCo=="Axis.2_res") %>% slice_max(abs_value, n=30) %>%
+  ggplot(aes(x=value,y=reorder(ASV_name, -value), fill=pos_neg))+ 
+               geom_bar(stat = "identity" ,width = 0.7) +
+  theme(axis.text.y = ggtext::element_markdown(), legend.position="none") +
+  scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  ylab("ASV") + xlab("Spearman correlation coefficient")+
+  scale_x_continuous(breaks=seq(-0.8,0.8,0.2), limits=c(-0.8, 0.8))
+
+a3 <- cor_mx_data_melt %>% subset(PCo=="Axis.3_res") %>% slice_max(abs_value, n=30) %>%
+  ggplot(aes(x=value,y=reorder(ASV_name, -value), fill=pos_neg))+ 
+               geom_bar(stat = "identity" ,width = 0.7) +
+  theme(axis.text.y = ggtext::element_markdown(), legend.position="none") +
+  scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  ylab("ASV") + xlab("Spearman correlation coefficient")+
+  scale_x_continuous(breaks=seq(-0.8,0.8,0.2), limits=c(-0.8, 0.8))
+
+a4 <- cor_mx_data_melt %>% subset(PCo=="Axis.4_res") %>% slice_max(abs_value, n=30) %>%
+  ggplot(aes(x=value,y=reorder(ASV_name, -value), fill=pos_neg))+ 
+               geom_bar(stat = "identity" ,width = 0.7) +
+  theme(axis.text.y = ggtext::element_markdown(), legend.position="none") +
+  scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  ylab("ASV") + xlab("Spearman correlation coefficient")+
+  scale_x_continuous(breaks=seq(-0.8,0.8,0.2), limits=c(-0.8, 0.8))
+
+
+joint_correl <- ggarrange(a1, a2, a3, a4, nrow=2, ncol=2, labels = c("PCo1_res", "PCo2_res", "PCo3_res", "PCo4_res"), font.label = list(size = 13))
+joint_correl
+
+png(file=here("results", "figures", "pcoa_correlations_matchingsample_afterresidualisation.png"), width = 17, height =17 , units = "in",res=300)
+print(joint_correl)
+dev.off()
+
+```
+
+# Baseline model: adjusted for GA at birth and GA at scan (using residualised (against PMA at sample collection) microbiota features)
+
+## Volumetric measures
+
+```{r baseline_model_volumes, ow="50%"}
+
+results_table_volumes <- data.frame(matrix(ncol = 16, nrow = 0))
+x <- c("Microbiota_metric", "Brain_feature", "beta", "se","pval", "GAbirth_beta", "GAbirth_se", "GAbirth_pval", "GAmri_beta", "GAmri_se", "GAmri_pval", "multiple_r2_baseline", "adj_r2_baseline", "multiple_r2_model", "adj_r2_model", "model_diff_pval")
+colnames(results_table_volumes) <- x
+
+for (j in 186:191) {
+  #
+  microbiota_metric <- print(names(all_data_resid[j]))
+
+  for (i in 18:27) {
+    #
+    brain_feature <- print(names(all_data_resid[i]))
+    fit <- lm(scale(all_data_resid[[i]]) ~ scale(all_data_resid[[j]]) + scale(GA_birth) + scale(GA_mri), data = all_data_resid)
+    fit_baseline <- lm(scale(all_data_resid[[i]]) ~ scale(GA_birth) + scale(GA_mri), data = all_data_resid) #fit model without microbiota to calculate incremental R2
+    print(summary(fit))
+    print(summary(fit_baseline))
+    print(anova(fit_baseline, fit))
+
+    #test if model residuals normally distributed
+    print(shapiro.test(fit[['residuals']]))
+    #print(bptest(fit))
+    #qqPlot(fit$residuals)
+    par(mfrow = c(2, 2))
+    plot(fit)
+    par(mfrow=c(1,1))
+    
+    tmp <- data.frame(matrix(ncol = 16, nrow = 1))
+    y <- c("Microbiota_metric", "Brain_feature", "beta", "se","pval", "GAbirth_beta", "GAbirth_se", "GAbirth_pval", "GAmri_beta", "GAmri_se", "GAmri_pval", "multiple_r2_baseline", "adj_r2_baseline", "multiple_r2_model", "adj_r2_model", "model_diff_pval")
+    colnames(tmp) <- y
+    tmp$Microbiota_metric <- microbiota_metric
+    tmp$Brain_feature <- brain_feature
+    tmp$beta <- fit$coefficients[2]
+    tmp$se <- summary(fit)$coefficients[2,2]
+    tmp$pval <- summary(fit)$coefficients[2,4]
+    
+    tmp$GAbirth_beta <- fit$coefficients[3]
+    tmp$GAbirth_se <- summary(fit)$coefficients[3,2]
+    tmp$GAbirth_pval <- summary(fit)$coefficients[3,4]
+    
+    tmp$GAmri_beta <- fit$coefficients[4]
+    tmp$GAmri_se <- summary(fit)$coefficients[4,2]
+    tmp$GAmri_pval <- summary(fit)$coefficients[4,4]
+    
+    tmp$multiple_r2_baseline <- summary(fit_baseline)$r.squared #R2 of the model without microbiota as predictor
+    tmp$adj_r2_baseline <- summary(fit_baseline)$adj.r.squared
+    tmp$multiple_r2_model <- summary(fit)$r.squared #R2 of the model with microbiota as predictor
+    tmp$adj_r2_model <- summary(fit)$adj.r.squared
+    tmp$model_diff_pval <- anova(fit_baseline, fit)[2,6] #anova for the model fit differences
+    
+    results_table_volumes <- rbind(results_table_volumes, tmp)
+    
+  }
+}
+
+results_table_volumes$adj_pval <- p.adjust(results_table_volumes$pval, method="BH")
+
+#calculate incremental R2 bu subtracting the R2 values of the model with and without microbiota features
+results_table_volumes <- results_table_volumes %>% mutate(diff_multiple_r2 = multiple_r2_model - multiple_r2_baseline,
+                                                          diff_adj_r2 = adj_r2_model - adj_r2_baseline) #in thesis reporting the value based on non-adjusted R2 because the adjusted already takes into account number of predictors, meaning that the resulting difference can be negative
+
+kable(results_table_volumes)
+
+write.csv(results_table_volumes, here("results", "tables", "microbiota_brainvolumes_baselinemodel.csv"), row.names=F)
+
+```
+
+Figure for the volumes
+
+```{r volume_figure, ow="50%"}
+
+#wrangle the results file to organise the feature groups
+
+results_table_volumes <- results_table_volumes %>% mutate(
+  brain_group = case_when(Brain_feature %in% c("Total_tissue_volume", "Ventricles_volume", "cGM_volume", "WM_volume",  "CB_volume",  "dGM_volume") ~ "Absolute volume",
+                          Brain_feature %in% c("cGM_relative_volume", "WM_relative_volume",  "CB_relative_volume",  "dGM_relative_volume") ~ "Relative volume"))
+
+results_table_volumes <- results_table_volumes %>% mutate(star = ifelse(adj_pval < 0.25, "*", ""),
+                                          significant = ifelse(pval < 0.05, "yes", "no"))
+
+results_table_volumes <- results_table_volumes %>% mutate(Microbiota_metric_renamed = case_when(Microbiota_metric=="Axis.1_res" ~ "PCo1",
+                                                                                Microbiota_metric=="Axis.2_res" ~  "PCo2",
+                                                                                Microbiota_metric=="Axis.3_res" ~  "PCo3",
+                                                                                Microbiota_metric=="Axis.4_res" ~  "PCo4",
+                                                                                Microbiota_metric=="Observed_rarefied_res" ~  "Observed species",
+                                                                                Microbiota_metric=="Shannon_rarefied_res" ~  "Shannon index"))
+
+results_table_volumes$Microbiota_metric_renamed <- as.factor(results_table_volumes$Microbiota_metric_renamed)
+results_table_volumes$Microbiota_metric_renamed <- factor(results_table_volumes$Microbiota_metric_renamed, levels = c("PCo1","PCo2","PCo3","PCo4","Observed species","Shannon index" ))
+
+results_table_volumes$Brain_feature <- as.factor(results_table_volumes$Brain_feature)
+results_table_volumes$Brain_feature <- factor(results_table_volumes$Brain_feature, levels = c("Total_tissue_volume", "Ventricles_volume", "cGM_volume", "WM_volume",  "CB_volume",  "dGM_volume", "cGM_relative_volume", "WM_relative_volume",  "CB_relative_volume",  "dGM_relative_volume"))
+
+fig_baseline_volumes <- results_table_volumes %>% mutate(group = if_else(beta < 0, "Negative effect", "Positive effect")) %>%
+               #filter(qval<0.25) %>%
+               ggplot(aes(x=beta,y=Brain_feature, fill=group, alpha=significant, color=group))+ 
+               geom_point(size=3, aes(color=group, fill=group))+
+   geom_errorbar( aes(y=Brain_feature, xmin=beta-se, xmax=beta+se), width=0.3, colour="black", alpha=0.9, size=0.4) +
+               scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_color_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_alpha_discrete(range = c(0.2, 1)) +
+  theme_bw(base_size=13) +
+  theme(axis.text.y = ggtext::element_markdown(size=12), legend.position = "none") + 
+  scale_x_continuous(limits = c(-0.5,0.5)) +
+  geom_text(aes(label = star, x=0.45), color="black") +
+  geom_vline(xintercept = 0, col="dark gray", linetype="dashed")+
+  xlab("Standardised \u03b2 with SE") +ylab("") + facet_grid(brain_group ~ Microbiota_metric_renamed, scales="free", space="free", switch = "y") + theme(
+    strip.placement = "outside", # Place facet labels outside x axis labels.
+    strip.background = element_blank(), # Make facet label background white.
+    legend.position = "none",
+    strip.text.y.left = element_text(angle = 0, size=12),
+    strip.text.x = element_text(angle = 0, size=12),
+    axis.text.x = element_text(size=9, angle = 45, hjust = 0.7)
+  ) +
+  scale_y_discrete(limits=rev)
+
+fig_baseline_volumes
+
+png(file=here("results", "figures", "baseline_microbiota_brain_volumes.png"), width = 17, height =3.2, units = "in",res=300)
+print(fig_baseline_volumes)
+dev.off()
+
+
+```
+
+## Microstructural measures
+
+```{r baseline_model_micro, ow="50%"}
+
+results_table_micro <- data.frame(matrix(ncol = 16, nrow = 0))
+x <- c("Microbiota_metric", "Brain_feature", "beta", "se","pval", "GAbirth_beta", "GAbirth_se", "GAbirth_pval", "GAmri_beta", "GAmri_se", "GAmri_pval", "multiple_r2_baseline", "adj_r2_baseline", "multiple_r2_model", "adj_r2_model", "model_diff_pval")
+colnames(results_table_micro) <- x
+
+for (j in 186:191) {
+  #
+  microbiota_metric <- print(names(all_data_resid[j]))
+
+  for (i in 28:52) {
+    #
+    brain_feature <- print(names(all_data_resid[i]))
+    fit <- lm(scale(all_data_resid[[i]]) ~ scale(all_data_resid[[j]]) + scale(GA_birth) + scale(GA_mri), data = all_data_resid)
+    fit_baseline <- lm(scale(all_data_resid[[i]]) ~ scale(GA_birth) + scale(GA_mri), data = all_data_resid)
+    print(summary(fit))
+    print(summary(fit_baseline))
+    print(anova(fit_baseline, fit))
+    
+    #test if model residuals normally distributed
+    print(shapiro.test(fit[['residuals']]))
+    #print(bptest(fit))
+    #qqPlot(fit$residuals)
+    par(mfrow = c(2, 2))
+    plot(fit)
+    par(mfrow=c(1,1))
+    
+    tmp <- data.frame(matrix(ncol = 16, nrow = 1))
+    y <- c("Microbiota_metric", "Brain_feature", "beta", "se","pval", "GAbirth_beta", "GAbirth_se", "GAbirth_pval", "GAmri_beta", "GAmri_se", "GAmri_pval", "multiple_r2_baseline", "adj_r2_baseline", "multiple_r2_model", "adj_r2_model", "model_diff_pval")
+    colnames(tmp) <- y
+    tmp$Microbiota_metric <- microbiota_metric
+    tmp$Brain_feature <- brain_feature
+    tmp$beta <- fit$coefficients[2]
+    tmp$se <- summary(fit)$coefficients[2,2]
+    tmp$pval <- summary(fit)$coefficients[2,4]
+    
+    tmp$GAbirth_beta <- fit$coefficients[3]
+    tmp$GAbirth_se <- summary(fit)$coefficients[3,2]
+    tmp$GAbirth_pval <- summary(fit)$coefficients[3,4]
+    
+    tmp$GAmri_beta <- fit$coefficients[4]
+    tmp$GAmri_se <- summary(fit)$coefficients[4,2]
+    tmp$GAmri_pval <- summary(fit)$coefficients[4,4]
+    
+    tmp$multiple_r2_baseline <- summary(fit_baseline)$r.squared
+    tmp$adj_r2_baseline <- summary(fit_baseline)$adj.r.squared
+    tmp$multiple_r2_model <- summary(fit)$r.squared
+    tmp$adj_r2_model <- summary(fit)$adj.r.squared
+    tmp$model_diff_pval <- anova(fit_baseline, fit)[2,6]
+    
+    results_table_micro <- rbind(results_table_micro, tmp)
+    
+  }
+}
+
+results_table_micro$adj_pval <- p.adjust(results_table_micro$pval, method="BH")
+
+#calculate incremental R2
+results_table_micro <- results_table_micro %>% mutate(diff_multiple_r2 = multiple_r2_model - multiple_r2_baseline,
+                                                          diff_adj_r2 = adj_r2_model - adj_r2_baseline)
+
+kable(results_table_micro)
+
+write.csv(results_table_micro, here("results", "tables", "microbiota_brainmicrostructure_baselinemodel.csv"), row.names=F)
+
+```
+
+Figure for the microstructure
+
+```{r micro_fig, ow="50%"}
+
+results_table_micro <- results_table_micro %>% mutate(
+  brain_group = case_when(Brain_feature %in% c("gFA", "gRD", "gNDI", "gODI", "gISO") ~ "White matter microstructure",
+                          Brain_feature %in% c("thickness", "sulc","curvature","GI","surface.area","cGM_FA", "cGM_RD", "cGM_NDI_GM", "cGM_ODI_GM", "cGM_ISO_GM") ~ "Cortical complexity and microstructure",
+                          Brain_feature %in% c("dGM_FA", "dGM_RD", "dGM_NDI_GM", "dGM_ODI_GM", "dGM_ISO_GM") ~ "Deep grey matter microstructure",
+                          Brain_feature %in% c("CB_FA", "CB_RD", "CB_NDI_GM", "CB_ODI_GM", "CB_ISO_GM") ~ "Cerebellar microstructure"))
+
+results_table_micro$brain_group <- factor(results_table_micro$brain_group, levels=c("White matter microstructure", "Cortical complexity and microstructure", "Deep grey matter microstructure", "Cerebellar microstructure"))
+
+results_table_micro <- results_table_micro %>% mutate(star = ifelse(adj_pval < 0.25, "*", ""),
+                                          significant = ifelse(pval < 0.05, "yes", "no"))
+
+results_table_micro <- results_table_micro %>% mutate(Microbiota_metric_renamed = case_when(Microbiota_metric=="Axis.1_res" ~ "PCo1",
+                                                                                Microbiota_metric=="Axis.2_res" ~  "PCo2",
+                                                                                Microbiota_metric=="Axis.3_res" ~  "PCo3",
+                                                                                Microbiota_metric=="Axis.4_res" ~  "PCo4",
+                                                                                Microbiota_metric=="Observed_rarefied_res" ~  "Observed species",
+                                                                                Microbiota_metric=="Shannon_rarefied_res" ~  "Shannon index"))
+
+results_table_micro$Microbiota_metric_renamed <- as.factor(results_table_micro$Microbiota_metric_renamed)
+results_table_micro$Microbiota_metric_renamed <- factor(results_table_micro$Microbiota_metric_renamed, levels = c("PCo1","PCo2","PCo3","PCo4","Observed species","Shannon index" ))
+
+results_table_micro <- results_table_micro %>% mutate(Brain_feature_renamed = case_when(Brain_feature=="CB_ISO_GM"~"CB_ISO",
+                                                                                Brain_feature=="CB_NDI_GM"~"CB_NDI",
+                                                                                Brain_feature=="CB_ODI_GM"~"CB_ODI",
+                                                                                Brain_feature=="cGM_ISO_GM"~"cGM_ISO",
+                                                                                Brain_feature=="cGM_NDI_GM"~"cGM_NDI",
+                                                                                Brain_feature=="cGM_ODI_GM"~"cGM_ODI",
+                                                                                Brain_feature=="dGM_ISO_GM"~"dGM_ISO",
+                                                                                Brain_feature=="dGM_NDI_GM"~"dGM_NDI",
+                                                                                Brain_feature=="dGM_ODI_GM"~"dGM_ODI",
+                                                                                TRUE ~ Brain_feature))
+results_table_micro$Brain_feature_renamed <- as.factor(results_table_micro$Brain_feature_renamed)
+results_table_micro$Brain_feature_renamed <- factor(results_table_micro$Brain_feature_renamed, levels = c("gFA", "gRD", "gNDI", "gODI", "gISO", "thickness", "sulc","curvature","GI","surface.area","cGM_FA", "cGM_RD", "cGM_NDI", "cGM_ODI", "cGM_ISO", "dGM_FA", "dGM_RD", "dGM_NDI", "dGM_ODI", "dGM_ISO", "CB_FA", "CB_RD", "CB_NDI", "CB_ODI", "CB_ISO"))
+
+
+fig_baseline_micro <- results_table_micro %>% mutate(group = if_else(beta < 0, "Negative effect", "Positive effect")) %>%
+               #filter(qval<0.25) %>%
+               ggplot(aes(x=beta,y=Brain_feature_renamed, fill=group, alpha=significant, color=group))+ 
+               geom_point(size=3, aes(color=group, fill=group))+
+   geom_errorbar( aes(y=Brain_feature_renamed, xmin=beta-se, xmax=beta+se), width=0.3, colour="black", alpha=0.9, size=0.4) +
+               scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_color_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_alpha_discrete(range = c(0.2, 1)) +
+  theme_bw(base_size=13) +
+  theme(axis.text.y = ggtext::element_markdown(size=12), legend.position = "none") + 
+  scale_x_continuous(limits = c(-0.5,0.5)) +
+  geom_text(aes(label = star, x=0.45), color="black") +
+  geom_vline(xintercept = 0, col="dark gray", linetype="dashed")+
+  xlab("Standardised \u03b2 with SE") +ylab("") + facet_grid(brain_group ~ Microbiota_metric_renamed, scales="free", space="free", switch = "y") + theme(
+    strip.placement = "outside", # Place facet labels outside x axis labels.
+    strip.background = element_blank(), # Make facet label background white.
+    legend.position = "none",
+    strip.text.y.left = element_text(angle = 0, size=12),
+    strip.text.x = element_text(angle = 0, size=12),
+    axis.text.x = element_text(size=9, angle = 45, hjust = 0.7)
+  ) +
+  scale_y_discrete(limits=rev)
+
+fig_baseline_micro
+
+png(file=here("results", "figures", "baseline_microbiota_brain_microstructure.png"), width = 17, height =6 , units = "in",res=300)
+print(fig_baseline_micro)
+dev.off()
+  
+
+```
+
+# Covariate adjustment
+
+Need to adjust for variables that are associated with the independent variable of interest; these in the first instance are GA at birth and GA at scan; then add variables which are associated with both the brain and microbiota
+
+Here do t-tests and correlation tests for the features from Chapter 5 associated with beta- or alpha diversity
+
+```{r covariate_testing}
+
+#check distribution of brain variables
+library(MVN)
+mvn1 <- mvn(data = all_brain_matching[2:19], univariateTest = "SW", univariatePlot = "histogram")
+mvn2 <- mvn(data = all_brain_matching[20:ncol(all_brain_matching)], univariateTest = "SW", univariatePlot = "histogram")
+
+kable(mvn1$univariateNormality)
+kable(mvn2$univariateNormality)
+
+normality <- rbind(mvn1$univariateNormality, mvn2$univariateNormality)
+
+hist(all_data$birthweight_z_score)
+shapiro.test(all_data$birthweight_z_score)
+
+norm_dist <- normality$Variable[which(normality$Normality=="   YES   ")]
+norm_dist <- gsub(" ", "", norm_dist, fixed = TRUE)
+
+#----------------------
+#do all t-tests or wilcox.tests for the brain indices and categorical variables and write them into a table
+
+cat_var <- c("sex", "AB_after72h", "nec_binary")
+
+#make empty dataframe where to write results
+results_covar_cat <- data.frame(matrix(ncol = 4, nrow = 0))
+x <- c("brain_measure", "variable_name", "statistic", "pvalue")
+colnames(results_covar_cat) <- x
+
+
+for (i in 18:52) {
+    #
+    brain_feature <- print(names(all_data[i]))
+  
+  for (var in 1:length(cat_var)){
+    variable <- cat_var[var]
+    #print(variable)
+    formula <- as.formula(paste(brain_feature, variable, sep="~"))
+    #print(formula)
+    
+    if(brain_feature %in% norm_dist){
+      model <- t.test(formula, data=all_data)
+      statistic <- paste("t=", model$statistic[1], paste="")
+    } else {
+      model <- wilcox.test(formula, data=all_data)
+      statistic <- paste("W=", model$statistic[1], paste="")
+    }
+    
+    
+    tmp <-data.frame(matrix(ncol = 4, nrow = 1))
+    y <- c("brain_measure", "variable_name", "statistic", "pvalue")
+    colnames(tmp) <- y
+  
+    tmp$brain_measure <- brain_feature
+    tmp$variable_name <- variable
+    tmp$statistic <- statistic
+    tmp$pvalue <- model$p.value
+    
+    #print(tmp)
+    results_covar_cat <- rbind(results_covar_cat, tmp)
+  }
+}
+
+#do all spearman collerations for the brain indices and continuous variables and write them into a table
+
+cont_var_names <- c("birthweight_z_score")
+
+#make empty dataframe where to write results
+results_covar_cont <- data.frame(matrix(ncol = 4, nrow = 0))
+x <- c("brain_measure", "variable_name", "statistic", "pvalue")
+colnames(results_covar_cont) <- x
+
+for (i in 18:52) {
+    #
+    brain_feature <- print(names(all_data[i]))
+  
+  for (var in 1:length(cont_var_names)){
+    variable <- cont_var_names[var]
+   # print(variable)
+    formula <- as.formula(paste("~ ", brain_feature, " + ", variable, sep=""))
+   # print(formula)
+    
+    model <- cor.test(formula, data=all_data, method="spearman")
+    statistic <- paste("rho=", model$estimate[1], paste="")
+    
+    tmp <-data.frame(matrix(ncol = 4, nrow = 1))
+    y <- c("brain_measure", "variable_name", "statistic", "pvalue")
+    colnames(tmp) <- y
+  
+    tmp$brain_measure <- brain_feature
+    tmp$variable_name <- variable
+    tmp$statistic <- model$estimate[1]
+    tmp$pvalue <- model$p.value
+    
+    #print(tmp)
+    results_covar_cont <- rbind(results_covar_cont, tmp)
+  }
+}
+
+#bind all the results together, add statistic names and do p-value adjustment
+results_covar <- rbind(results_covar_cat, results_covar_cont)
+results_covar <- results_covar %>% mutate(adj_pvalue = p.adjust(results_covar$pvalue, method="BH"))
+
+kable(results_covar)
+
+#list of covariates: those with nominally significant effects with brain measures
+covars <- results_covar$variable_name[which(results_covar$pvalue<0.05)]
+covars #nec_binary, sex, birthweight_z_score
+
+
+```
+
+Do covariate adjustment for those models with adjusted p-value <0.25
+
+Only microstructure features had significant associations so will continue with those
+
+```{r covar_adjustment}
+
+sign_results <- results_table_micro %>% subset(adj_pval<0.25)
+sign_results <- sign_results %>% mutate(model=paste(Microbiota_metric, Brain_feature, sep="_"))
+
+results_table_fullyadj <- data.frame(matrix(ncol = 10, nrow = 0))
+x <- c("Microbiota_metric", "Brain_feature", "beta", "se","pval", "multiple_r2_baseline", "adj_r2_baseline", "multiple_r2_model", "adj_r2_model", "model_diff_pval")
+colnames(results_table_fullyadj) <- x
+
+for (j in unique(sign_results$Microbiota_metric)) {
+  #
+  microbiota_metric <- print(names(all_data_resid[j]))
+
+  for (i in unique(sign_results$Brain_feature)) {
+    #
+    brain_feature <- print(names(all_data_resid[i]))
+    fit <- lm(scale(all_data_resid[[i]]) ~ scale(all_data_resid[[j]]) + scale(GA_birth) + scale(GA_mri) + scale(birthweight_z_score) + as.factor(sex), data = all_data_resid)
+    fit_baseline <- lm(scale(all_data_resid[[i]]) ~ scale(GA_birth) + scale(GA_mri) + scale(birthweight_z_score) + as.factor(sex), data = all_data_resid)
+    print(summary(fit))
+    print(summary(fit_baseline))
+    print(anova(fit_baseline, fit))
+    
+    #test if model residuals normally distributed
+    print(shapiro.test(fit[['residuals']]))
+    #print(bptest(fit))
+    #qqPlot(fit$residuals)
+    par(mfrow = c(2, 2))
+    plot(fit)
+    par(mfrow=c(1,1))
+    
+    tmp <- data.frame(matrix(ncol = 10, nrow = 1))
+    y <- c("Microbiota_metric", "Brain_feature", "beta", "se","pval", "multiple_r2_baseline", "adj_r2_baseline", "multiple_r2_model", "adj_r2_model", "model_diff_pval")
+    colnames(tmp) <- y
+    tmp$Microbiota_metric <- microbiota_metric
+    tmp$Brain_feature <- brain_feature
+    tmp$beta <- fit$coefficients[2]
+    tmp$se <- summary(fit)$coefficients[2,2]
+    tmp$pval <- summary(fit)$coefficients[2,4]
+    
+    tmp$multiple_r2_baseline <- summary(fit_baseline)$r.squared
+    tmp$adj_r2_baseline <- summary(fit_baseline)$adj.r.squared
+    tmp$multiple_r2_model <- summary(fit)$r.squared
+    tmp$adj_r2_model <- summary(fit)$adj.r.squared
+    tmp$model_diff_pval <- anova(fit_baseline, fit)[2,6]
+    
+    results_table_fullyadj <- rbind(results_table_fullyadj, tmp)
+    
+  }
+}
+
+#subset only to the models needed - the ones with adjusted p-value<0.25 in the main models
+results_table_fullyadj <- results_table_fullyadj %>% mutate(model=paste(Microbiota_metric, Brain_feature, sep="_"))
+results_table_fullyadj <- results_table_fullyadj %>% subset(model %in% sign_results$model)
+
+#p-value adjustment
+results_table_fullyadj$adj_pval <- p.adjust(results_table_fullyadj$pval, method="BH")
+
+#calculate incremental R2
+results_table_fullyadj <- results_table_fullyadj %>% mutate(diff_multiple_r2 = multiple_r2_model - multiple_r2_baseline,
+                                                          diff_adj_r2 = adj_r2_model - adj_r2_baseline)
+
+kable(results_table_fullyadj)
+
+write.csv(results_table_fullyadj, here("results", "tables", "microbiota_brainmicrostructure_fullyadjustedmodel.csv"), row.names=F)
+
+##########################################
+#make a figure
+results_table_fullyadj <- results_table_fullyadj %>% mutate(Microbiota_metric_renamed = case_when(Microbiota_metric=="Axis.1_res" ~ "PCo1",
+                                                                                Microbiota_metric=="Axis.2_res" ~  "PCo2",
+                                                                                Microbiota_metric=="Axis.3_res" ~  "PCo3",
+                                                                                Microbiota_metric=="Axis.4_res" ~  "PCo4",
+                                                                                Microbiota_metric=="Observed_rarefied_res" ~  "Observed species",
+                                                                                Microbiota_metric=="Shannon_rarefied_res" ~  "Shannon index"))
+
+results_table_fullyadj <- results_table_fullyadj %>% mutate(Brain_feature_renamed = case_when(Brain_feature=="CB_ISO_GM"~"CB_ISO",
+                                                                                Brain_feature=="CB_NDI_GM"~"CB_NDI",
+                                                                                Brain_feature=="CB_ODI_GM"~"CB_ODI",
+                                                                                Brain_feature=="cGM_ISO_GM"~"cGM_ISO",
+                                                                                Brain_feature=="cGM_NDI_GM"~"cGM_NDI",
+                                                                                Brain_feature=="cGM_ODI_GM"~"cGM_ODI",
+                                                                                Brain_feature=="dGM_ISO_GM"~"dGM_ISO",
+                                                                                Brain_feature=="dGM_NDI_GM"~"dGM_NDI",
+                                                                                Brain_feature=="dGM_ODI_GM"~"dGM_ODI",
+                                                                                TRUE ~ Brain_feature))
+results_table_fullyadj$Brain_feature_renamed <- as.factor(results_table_fullyadj$Brain_feature_renamed)
+results_table_fullyadj$Brain_feature_renamed <- factor(results_table_fullyadj$Brain_feature_renamed, levels = c("gFA", "gRD", "gNDI", "gODI", "gISO", "thickness", "sulc","curvature","GI","surface.area","cGM_FA", "cGM_RD", "cGM_NDI", "cGM_ODI", "cGM_ISO", "dGM_FA", "dGM_RD", "dGM_NDI", "dGM_ODI", "dGM_ISO", "CB_FA", "CB_RD", "CB_NDI", "CB_ODI", "CB_ISO"))
+
+results_table_fullyadj <- results_table_fullyadj %>% mutate(star = ifelse(adj_pval < 0.05, "*", ""),
+                                          significant = ifelse(pval < 0.05, "yes", "no"))
+
+
+full_sign_figure <- results_table_fullyadj %>% mutate(group = if_else(beta < 0, "Negative effect", "Positive effect")) %>%
+               #filter(qval<0.25) %>%
+               ggplot(aes(x=beta,y=Brain_feature_renamed, fill=group, alpha=significant, color=group))+ 
+               geom_point(size=3, aes(color=group, fill=group))+
+   geom_errorbar( aes(y=Brain_feature_renamed, xmin=beta-se, xmax=beta+se), width=0.3, colour="black", alpha=0.9, size=0.4) +
+               scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_color_manual(values=c("#34487A", "#CF5A47"), name="") +
+  #scale_alpha_discrete(range = c(0.2, 1)) +
+  theme_bw(base_size=13) +
+  theme(axis.text.y = ggtext::element_markdown(size=12), legend.position = "none") + 
+  scale_x_continuous(limits = c(-0.5,0.5)) +
+  geom_text(aes(label = star, x=0.45), color="black") +
+  geom_vline(xintercept = 0, col="dark gray", linetype="dashed")+
+  xlab("Standardised \u03b2 with SE") +ylab("") + ggforce::facet_col(vars(Microbiota_metric_renamed), scales = "free", space = "free") + theme(
+    strip.placement = "outside", # Place facet labels outside x axis labels.
+    strip.background = element_blank(), # Make facet label background white.
+    legend.position = "none",
+    strip.text.y.left = element_text(angle = 0, size=12),
+    strip.text.x = element_text(angle = 0, size=12),
+    axis.text.x = element_text(size=9, angle = 45, hjust = 0.7)
+  ) +
+  scale_y_discrete(limits=rev)
+
+full_sign_figure
+
+
+png(file=here("results", "figures", "full_significant_microbiota_brain.png"), width = 8, height =7.5 , units = "in",res=300)
+print(full_sign_figure)
+dev.off()
+  
+
+```
+
+Do sensitivity analysis in infants without NEC
+
+```{r sensitivity_nonec}
+
+all_data_resid_nonec <- all_data_resid %>% subset(nec_binary==0)
+
+results_table_fullyadj_nonec <- data.frame(matrix(ncol = 10, nrow = 0))
+x <- c("Microbiota_metric", "Brain_feature", "beta", "se","pval", "multiple_r2_baseline", "adj_r2_baseline", "multiple_r2_model", "adj_r2_model", "model_diff_pval")
+colnames(results_table_fullyadj_nonec) <- x
+
+for (j in unique(sign_results$Microbiota_metric)) {
+  #
+  microbiota_metric <- print(names(all_data_resid_nonec[j]))
+
+  for (i in unique(sign_results$Brain_feature)) {
+    #
+    brain_feature <- print(names(all_data_resid_nonec[i]))
+    fit <- lm(scale(all_data_resid_nonec[[i]]) ~ scale(all_data_resid_nonec[[j]]) + scale(GA_birth) + scale(GA_mri) + scale(birthweight_z_score) + as.factor(sex), data = all_data_resid_nonec)
+    fit_baseline <- lm(scale(all_data_resid_nonec[[i]]) ~ scale(GA_birth) + scale(GA_mri) + scale(birthweight_z_score) + as.factor(sex), data = all_data_resid_nonec)
+    print(summary(fit))
+    print(summary(fit_baseline))
+    print(anova(fit_baseline, fit))
+    
+    #test if model residuals normally distributed
+    print(shapiro.test(fit[['residuals']]))
+    #print(bptest(fit))
+    qqPlot(fit$residuals)
+    par(mfrow = c(2, 2))
+    plot(fit)
+    par(mfrow=c(1,1))
+    
+    tmp <- data.frame(matrix(ncol = 10, nrow = 1))
+    y <- c("Microbiota_metric", "Brain_feature", "beta", "se","pval", "multiple_r2_baseline", "adj_r2_baseline", "multiple_r2_model", "adj_r2_model", "model_diff_pval")
+    colnames(tmp) <- y
+    tmp$Microbiota_metric <- microbiota_metric
+    tmp$Brain_feature <- brain_feature
+    tmp$beta <- fit$coefficients[2]
+    tmp$se <- summary(fit)$coefficients[2,2]
+    tmp$pval <- summary(fit)$coefficients[2,4]
+    
+    tmp$multiple_r2_baseline <- summary(fit_baseline)$r.squared
+    tmp$adj_r2_baseline <- summary(fit_baseline)$adj.r.squared
+    tmp$multiple_r2_model <- summary(fit)$r.squared
+    tmp$adj_r2_model <- summary(fit)$adj.r.squared
+    tmp$model_diff_pval <- anova(fit_baseline, fit)[2,6]
+    
+    results_table_fullyadj_nonec <- rbind(results_table_fullyadj_nonec, tmp)
+    
+  }
+}
+
+#subset only to the models needed - the ones with adjusted p-value<0.25 in the main models
+results_table_fullyadj_nonec <- results_table_fullyadj_nonec %>% mutate(model=paste(Microbiota_metric, Brain_feature, sep="_"))
+results_table_fullyadj_nonec <- results_table_fullyadj_nonec %>% subset(model %in% sign_results$model)
+
+#p-value adjustment
+results_table_fullyadj_nonec$adj_pval <- p.adjust(results_table_fullyadj_nonec$pval, method="BH")
+
+#calculate incremental R2
+results_table_fullyadj_nonec <- results_table_fullyadj_nonec %>% mutate(diff_multiple_r2 = multiple_r2_model - multiple_r2_baseline,
+                                                          diff_adj_r2 = adj_r2_model - adj_r2_baseline)
+
+kable(results_table_fullyadj_nonec)
+
+write.csv(results_table_fullyadj_nonec, here("results", "tables", "microbiota_brainmicrostructure_fullyadjustedmodel_nonecsepsis.csv"), row.names=F)
+
+###############################
+#make a figure
+results_table_fullyadj_nonec <- results_table_fullyadj_nonec %>% mutate(Microbiota_metric_renamed = case_when(Microbiota_metric=="Axis.1_res" ~ "PCo1",
+                                                                                Microbiota_metric=="Axis.2_res" ~  "PCo2",
+                                                                                Microbiota_metric=="Axis.3_res" ~  "PCo3",
+                                                                                Microbiota_metric=="Axis.4_res" ~  "PCo4",
+                                                                                Microbiota_metric=="Observed_rarefied_res" ~  "Observed species",
+                                                                                Microbiota_metric=="Shannon_rarefied_res" ~  "Shannon index"))
+
+results_table_fullyadj_nonec <- results_table_fullyadj_nonec %>% mutate(Brain_feature_renamed = case_when(Brain_feature=="CB_ISO_GM"~"CB_ISO",
+                                                                                Brain_feature=="CB_NDI_GM"~"CB_NDI",
+                                                                                Brain_feature=="CB_ODI_GM"~"CB_ODI",
+                                                                                Brain_feature=="cGM_ISO_GM"~"cGM_ISO",
+                                                                                Brain_feature=="cGM_NDI_GM"~"cGM_NDI",
+                                                                                Brain_feature=="cGM_ODI_GM"~"cGM_ODI",
+                                                                                Brain_feature=="dGM_ISO_GM"~"dGM_ISO",
+                                                                                Brain_feature=="dGM_NDI_GM"~"dGM_NDI",
+                                                                                Brain_feature=="dGM_ODI_GM"~"dGM_ODI",
+                                                                                TRUE ~ Brain_feature))
+results_table_fullyadj_nonec$Brain_feature_renamed <- as.factor(results_table_fullyadj_nonec$Brain_feature_renamed)
+results_table_fullyadj_nonec$Brain_feature_renamed <- factor(results_table_fullyadj_nonec$Brain_feature_renamed, levels = c("gFA", "gRD", "gNDI", "gODI", "gISO", "thickness", "sulc","curvature","GI","surface.area","cGM_FA", "cGM_RD", "cGM_NDI", "cGM_ODI", "cGM_ISO", "dGM_FA", "dGM_RD", "dGM_NDI", "dGM_ODI", "dGM_ISO", "CB_FA", "CB_RD", "CB_NDI", "CB_ODI", "CB_ISO"))
+
+results_table_fullyadj_nonec <- results_table_fullyadj_nonec %>% mutate(star = ifelse(adj_pval < 0.05, "*", ""),
+                                          significant = ifelse(pval < 0.05, "yes", "no"))
+
+
+full_sign_figure_nonec <- results_table_fullyadj_nonec %>% mutate(group = if_else(beta < 0, "Negative effect", "Positive effect")) %>%
+               #filter(qval<0.25) %>%
+               ggplot(aes(x=beta,y=Brain_feature_renamed, fill=group, color=group, alpha=significant))+ 
+               geom_point(size=3, aes(color=group, fill=group))+
+   geom_errorbar( aes(y=Brain_feature_renamed, xmin=beta-se, xmax=beta+se), width=0.3, colour="black", alpha=0.9, size=0.4) +
+               scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_color_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_alpha_discrete(range = c(0.2, 1)) +
+  theme_bw(base_size=13) +
+  theme(axis.text.y = ggtext::element_markdown(size=12), legend.position = "none") + 
+  scale_x_continuous(limits = c(-0.5,0.5)) +
+  geom_text(aes(label = star, x=0.45), color="black") +
+  geom_vline(xintercept = 0, col="dark gray", linetype="dashed")+
+  xlab("Standardised \u03b2 with SE") +ylab("") + ggforce::facet_col(vars(Microbiota_metric_renamed), scales = "free", space = "free") + theme(
+    strip.placement = "outside", # Place facet labels outside x axis labels.
+    strip.background = element_blank(), # Make facet label background white.
+    legend.position = "none",
+    strip.text.y.left = element_text(angle = 0, size=12),
+    strip.text.x = element_text(angle = 0, size=12),
+    axis.text.x = element_text(size=9, angle = 45, hjust = 0.7)
+  ) +
+  scale_y_discrete(limits=rev)
+
+full_sign_figure_nonec
+
+full_nonec_fig <- ggarrange(full_sign_figure, full_sign_figure_nonec, labels=c("A", "B"))
+
+full_nonec_fig
+
+
+png(file=here("results", "figures", "all_sensitivity_microbiota_brain.png"), width = 9, height =6 , units = "in",res=300)
+print(full_nonec_fig)
+dev.off()
+
+```
+
+# Maaslin2 for the associated brain features
+
+First residualise the brain features against GA at scan (and at birth)
+Load the phyloseq object with all relative abundances
+Then do Maaslin2, adjusting for PMA at sample collection -> one model for each of the variable separately
+
+```{r maaslin, ow="50%"}
+
+#take out the associated brain features and metadata
+sign_brain <- all_data %>% select(sample_work_nr, record_id, sample_id, Visit_number, 
+                                  GA_birth, extremely_preterm, postnatal_age_at_sample_d, PMA_sample_w,
+                                  sex, GA_mri, birthweight_z_score, nec_binary, Vaginal_delivery,
+                                  BM_75, 
+                                  dGM_FA, dGM_NDI_GM, dGM_ODI_GM, cGM_ODI_GM, gRD, gODI)
+
+#residualise the brain features against GA at MRI and GA at birth
+sign_brain <- sign_brain %>% mutate(dGM_FA_res = resid(lm(scale(dGM_FA) ~ scale(GA_mri) + scale(GA_birth), data=sign_brain, na.action=na.exclude)), 
+                                    dGM_NDI_GM_res = resid(lm(scale(dGM_NDI_GM) ~ scale(GA_mri)+ scale(GA_birth), data=sign_brain, na.action=na.exclude)), 
+                                    dGM_ODI_GM_res = resid(lm(scale(dGM_ODI_GM) ~ scale(GA_mri)+ scale(GA_birth), data=sign_brain, na.action=na.exclude)), 
+                                    gRD_res = resid(lm(scale(gRD) ~ scale(GA_mri)+ scale(GA_birth), data=sign_brain, na.action=na.exclude)),
+                                    cGM_ODI_GM_res = resid(lm(scale(cGM_ODI_GM) ~ scale(GA_mri)+ scale(GA_birth), data=sign_brain, na.action=na.exclude)),
+                                    gODI_res = resid(lm(scale(gODI) ~ scale(GA_mri)+ scale(GA_birth), data=sign_brain, na.action=na.exclude))
+                                    )
+
+
+hist(sign_brain$dGM_FA_res)
+hist(sign_brain$dGM_NDI_GM_res)
+hist(sign_brain$dGM_ODI_GM_res)
+hist(sign_brain$cGM_ODI_GM_res)
+hist(sign_brain$gRD_res)
+hist(sign_brain$gODI_res)
+
+#read in the phyloseq object to get the full OTU table
+library(phyloseq)
+phy_RA <- readRDS(here("processed_data", "qc_decontam", "ps_final_RA.Rds"))
+
+#subset the phyloseq object to only matching sample
+phy_RA_matching <- phy_RA %>% subset_samples((sample_id2 %in% sign_brain$sample_id))
+
+#prepare input for maaslin
+matching_asv <- t(data.frame(otu_table(phy_RA_matching)))
+brain_meta <- sign_brain
+rownames(brain_meta) <- brain_meta$sample_work_nr
+
+#match the order of the metadata to that of the ASV table
+brain_meta=brain_meta[match(rownames(matching_asv),rownames(brain_meta)),]
+
+#check whether in the same order
+all(rownames(brain_meta)==rownames(matching_asv))
+
+
+#now do maaslin separately for each brain feature, adjusting for GA at sample collection
+library(Maaslin2)
+source(here("src", "utils_kadi.R"))
+
+maaslin_dGM_FA_res_adjPMAsample = Maaslin2(
+    input_data = matching_asv, 
+    input_metadata = brain_meta, 
+    min_prevalence = 0.1,
+    min_abundance = 0.01,
+    normalization = "NONE",
+    output = here("results", "maaslin_results", "maaslin_dGM_FA_res_adjPMAsample"), 
+    fixed_effects = c("dGM_FA_res", "PMA_sample_w"))
+
+kable(maaslin_dGM_FA_res_adjPMAsample$results%>%
+              subset(metadata=="dGM_FA_res"))
+
+as.data.frame(maaslin_dGM_FA_res_adjPMAsample$results)%>%
+              subset(metadata=="dGM_FA_res") %>%
+               arrange(coef)%>%
+               filter(qval<0.25) %>%
+               mutate(group = if_else(coef<0, "negative correlation", "positive correlation"),
+                      feature_new = format_OTU(feature),
+                      feature_new=factor(feature_new, levels = feature_new)) %>%
+               ggplot(aes(x=coef,y=feature_new, fill=group))+ 
+               geom_bar(stat = "identity" ,width = 0.5)+
+   geom_errorbar( aes(y=feature_new, xmin=coef-stderr, xmax=coef+stderr), width=0.05, colour="black", alpha=0.9, size=0.3) +
+               scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  theme_bw(base_size=13) +
+  theme(axis.text.y = ggtext::element_markdown(size=12)) + 
+  scale_x_continuous(labels = scales::number_format(accuracy = 0.1),limits = c(-2.5,2.5)) +
+  geom_vline(xintercept = 0, col="black")+
+  xlab("Model coefficient (effect size)") +ylab("") + ggtitle("dGM FA")
+
+
+maaslin_dGM_NDI_GM_res_adjPMAsample = Maaslin2(
+    input_data = matching_asv, 
+    input_metadata = brain_meta, 
+    min_prevalence = 0.1,
+    min_abundance = 0.01,
+    normalization = "NONE",
+    output = here("results", "maaslin_results", "maaslin_dGM_NDI_GM_res_adjPMAsample"), 
+    fixed_effects = c("dGM_NDI_GM_res", "PMA_sample_w"))
+
+kable(maaslin_dGM_NDI_GM_res_adjPMAsample$results%>%
+              subset(metadata=="dGM_NDI_GM_res"))
+
+as.data.frame(maaslin_dGM_NDI_GM_res_adjPMAsample$results)%>%
+              subset(metadata=="dGM_NDI_GM_res") %>%
+               arrange(coef)%>%
+               filter(qval<0.25) %>%
+               mutate(group = if_else(coef<0, "negative correlation", "positive correlation"),
+                      feature_new = format_OTU(feature),
+                      feature_new=factor(feature_new, levels = feature_new)) %>%
+               ggplot(aes(x=coef,y=feature_new, fill=group))+ 
+               geom_bar(stat = "identity" ,width = 0.5)+
+   geom_errorbar( aes(y=feature_new, xmin=coef-stderr, xmax=coef+stderr), width=0.05, colour="black", alpha=0.9, size=0.3) +
+               scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  theme_bw(base_size=13) +
+  theme(axis.text.y = ggtext::element_markdown(size=12)) + 
+  scale_x_continuous(labels = scales::number_format(accuracy = 0.1),limits = c(-2.5,2.5)) +
+  geom_vline(xintercept = 0, col="black")+
+  xlab("Model coefficient (effect size)") +ylab("") + ggtitle("dGM NDI")
+
+
+maaslin_dGM_ODI_GM_res_adjPMAsample = Maaslin2(
+    input_data = matching_asv, 
+    input_metadata = brain_meta, 
+    min_prevalence = 0.1,
+    min_abundance = 0.01,
+    normalization = "NONE",
+    output = here("results", "maaslin_results", "maaslin_dGM_ODI_GM_res_adjPMAsample"), 
+    fixed_effects = c("dGM_ODI_GM_res", "PMA_sample_w"))
+
+kable(maaslin_dGM_ODI_GM_res_adjPMAsample$results%>%
+              subset(metadata=="dGM_ODI_GM_res"))
+
+as.data.frame(maaslin_dGM_ODI_GM_res_adjPMAsample$results)%>%
+              subset(metadata=="dGM_ODI_GM_res") %>%
+               arrange(coef)%>%
+               filter(qval<0.25) %>%
+               mutate(group = if_else(coef<0, "negative correlation", "positive correlation"),
+                      feature_new = format_OTU(feature),
+                      feature_new=factor(feature_new, levels = feature_new)) %>%
+               ggplot(aes(x=coef,y=feature_new, fill=group))+ 
+               geom_bar(stat = "identity" ,width = 0.5)+
+   geom_errorbar( aes(y=feature_new, xmin=coef-stderr, xmax=coef+stderr), width=0.05, colour="black", alpha=0.9, size=0.3) +
+               scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  theme_bw(base_size=13) +
+  theme(axis.text.y = ggtext::element_markdown(size=12)) + 
+  scale_x_continuous(labels = scales::number_format(accuracy = 0.1),limits = c(-2.5,2.5)) +
+  geom_vline(xintercept = 0, col="black")+
+  xlab("Model coefficient (effect size)") +ylab("") + ggtitle("dGM ODI")
+
+
+maaslin_cGM_ODI_GM_res_adjPMAsample = Maaslin2(
+    input_data = matching_asv, 
+    input_metadata = brain_meta, 
+    min_prevalence = 0.1,
+    min_abundance = 0.01,
+    normalization = "NONE",
+    output = here("results", "maaslin_results", "maaslin_cGM_ODI_GM_res_adjPMAsample"), 
+    fixed_effects = c("cGM_ODI_GM_res", "PMA_sample_w"))
+
+kable(maaslin_cGM_ODI_GM_res_adjPMAsample$results%>%
+              subset(metadata=="cGM_ODI_GM_res"))
+
+as.data.frame(maaslin_cGM_ODI_GM_res_adjPMAsample$results)%>%
+              subset(metadata=="cGM_ODI_GM_res") %>%
+               arrange(coef)%>%
+               filter(qval<0.25) %>%
+               mutate(group = if_else(coef<0, "negative correlation", "positive correlation"),
+                      feature_new = format_OTU(feature),
+                      feature_new=factor(feature_new, levels = feature_new)) %>%
+               ggplot(aes(x=coef,y=feature_new, fill=group))+ 
+               geom_bar(stat = "identity" ,width = 0.5)+
+   geom_errorbar( aes(y=feature_new, xmin=coef-stderr, xmax=coef+stderr), width=0.05, colour="black", alpha=0.9, size=0.3) +
+               scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  theme_bw(base_size=13) +
+  theme(axis.text.y = ggtext::element_markdown(size=12)) + 
+  scale_x_continuous(labels = scales::number_format(accuracy = 0.1),limits = c(-2.5,2.5)) +
+  geom_vline(xintercept = 0, col="black")+
+  xlab("Model coefficient (effect size)") +ylab("") + ggtitle("cGM ODI")
+
+
+
+maaslin_gRD_res_adjPMAsample = Maaslin2(
+    input_data = matching_asv, 
+    input_metadata = brain_meta, 
+    min_prevalence = 0.1,
+    min_abundance = 0.01,
+    normalization = "NONE",
+    output = here("results", "maaslin_results", "maaslin_gRD_res_adjPMAsample"), 
+    fixed_effects = c("gRD_res", "PMA_sample_w"))
+
+kable(maaslin_gRD_res_adjPMAsample$results%>%
+              subset(metadata=="gRD_res")) # -> non are significant here
+
+
+maaslin_gODI_res_adjPMAsample = Maaslin2(
+    input_data = matching_asv, 
+    input_metadata = brain_meta, 
+    min_prevalence = 0.1,
+    min_abundance = 0.01,
+    normalization = "NONE",
+    output = here("results", "maaslin_results", "maaslin_gODI_res_adjPMAsample"), 
+    fixed_effects = c("gODI_res", "PMA_sample_w"))
+
+kable(maaslin_gODI_res_adjPMAsample$results%>%
+              subset(metadata=="gODI_res")) # -> non are significant here
+
+```
+
+## Figure for maaslin
+Make a joint figure for all of the Maaslin results
+
+First need to put all the dataframes together
+
+```{r joint_maaslin, , ow="50%"}
+
+
+maaslindf_dGM_FA <- as.data.frame(maaslin_dGM_FA_res_adjPMAsample$results)%>%
+              subset(metadata=="dGM_FA_res")
+
+maaslindf_dGM_NDI_GM <- as.data.frame(maaslin_dGM_NDI_GM_res_adjPMAsample$results)%>%
+              subset(metadata=="dGM_NDI_GM_res")
+
+maaslindf_dGM_ODI_GM <- as.data.frame(maaslin_dGM_ODI_GM_res_adjPMAsample$results)%>%
+              subset(metadata=="dGM_ODI_GM_res")
+
+maaslindf_cGM_ODI_GM <- as.data.frame(maaslin_cGM_ODI_GM_res_adjPMAsample$results)%>%
+              subset(metadata=="cGM_ODI_GM_res")
+
+maaslindf_gRD <- as.data.frame(maaslin_gRD_res_adjPMAsample$results)%>%
+              subset(metadata=="gRD_res")
+
+maaslindf_gODI <- as.data.frame(maaslin_gODI_res_adjPMAsample$results)%>%
+              subset(metadata=="gODI_res")
+
+
+all_maaslindf <- rbind(maaslindf_dGM_FA, maaslindf_dGM_NDI_GM, maaslindf_dGM_ODI_GM, maaslindf_cGM_ODI_GM, maaslindf_gRD, maaslindf_gODI)
+
+all_maaslindf <- all_maaslindf %>% mutate(metadata_newname = case_when(metadata=="dGM_FA_res" ~ "dGM FA",
+                                                                       metadata=="dGM_NDI_GM_res" ~ "dGM NDI",
+                                                                       metadata=="dGM_ODI_GM_res" ~ "dGM ODI",
+                                                                       metadata=="cGM_ODI_GM_res" ~ "cGM ODI",
+                                                                       metadata=="gRD_res" ~ "gRD",
+                                                                       metadata=="gODI_res" ~ "gODI"))
+
+all_maaslindf <- all_maaslindf %>% mutate(star = ifelse(qval < 0.25, "*", ""),
+                                          significant = ifelse(qval < 0.25, "yes", "no"))
+
+all_maaslindf <- all_maaslindf %>% mutate(ASV_name = format_OTU(feature))
+
+library(tidytext)
+all_maaslin_baseline <- all_maaslindf %>% mutate(group = if_else(coef < 0, "Negative effect", "Positive effect")) %>% arrange(coef) %>%
+               #filter(qval<0.25) %>%
+               ggplot(aes(x=coef,y=ASV_name, fill=group, color=group, alpha=significant))+ 
+               geom_point(size=2)+
+   geom_errorbar( aes(y=ASV_name, xmin=coef-stderr, xmax=coef+stderr), width=0.05, colour="black", alpha=0.9, size=0.3) +
+               scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_color_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_alpha_discrete(range = c(0.2, 1)) +
+  theme_bw(base_size=13) +
+  theme(axis.text.y = ggtext::element_markdown(size=12), legend.position = "none") + 
+  scale_x_continuous(limits = c(-3,3)) +
+  geom_text(aes(label = star, x=2.8), color="black") +
+  geom_vline(xintercept = 0, col="black")+
+  xlab("Standardised \u03b2 with SE") +ylab("") + ggforce::facet_col(vars(metadata_newname), scales = "free", space = "free") + 
+  theme(
+    strip.placement = "outside", # Place facet labels outside x axis labels.
+    strip.background = element_blank(), # Make facet label background white.
+    legend.position = "none",
+    strip.text.x= element_text(size=12),
+    axis.text.y = ggtext::element_markdown(size=12),
+    #strip.text.y.left = element_text(angle = 0),
+    axis.text.x = element_text(size=9, angle = 45, hjust = 0.7)
+  )
+
+all_maaslin_baseline
+
+png(file=here("results", "figures", "baseline_microbiota_brain_maaslin.png"), width = 8, height =13 , units = "in",res=300)
+print(all_maaslin_baseline)
+dev.off()
+
+#--------------------------------------------
+#ordering the maaslin results better in the figure
+
+all_maaslindf <- all_maaslindf %>% mutate(abs_coef = abs(coef))
+
+maaslin_dGMfa <- all_maaslindf %>% mutate(group = if_else(coef < 0, "Negative effect", "Positive effect")) %>% arrange(coef) %>%
+               #filter(qval<0.25) %>%
+  subset(metadata=="dGM_FA_res") %>%
+               ggplot(aes(x=coef,y=reorder(ASV_name, abs_coef), fill=group, color=group, alpha=significant))+ 
+               geom_point(size=2)+
+   geom_errorbar( aes(y=ASV_name, xmin=coef-stderr, xmax=coef+stderr), width=0.05, colour="black", alpha=0.9, size=0.3) +
+               scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_color_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_alpha_discrete(range = c(0.2, 1)) +
+  theme_bw(base_size=13) +
+  theme(axis.text.y = ggtext::element_markdown(size=12), legend.position = "none") + 
+  scale_x_continuous(limits = c(-3,3)) +
+  geom_text(aes(label = star, x=2.8), color="black") +
+  geom_vline(xintercept = 0, col="black")+
+  xlab("Standardised \u03b2 with SE") +ylab("") + ggforce::facet_col(vars(metadata_newname), scales = "free", space = "free") + 
+  theme(
+    strip.placement = "outside", # Place facet labels outside x axis labels.
+    strip.background = element_blank(), # Make facet label background white.
+    legend.position = "none",
+    strip.text.x= element_text(size=12),
+    axis.text.y = ggtext::element_markdown(size=12),
+    #strip.text.y.left = element_text(angle = 0),
+    axis.text.x = element_text(size=9, angle = 45, hjust = 0.7)
+  )
+
+
+maaslin_dGMndi <- all_maaslindf %>% mutate(group = if_else(coef < 0, "Negative effect", "Positive effect")) %>% arrange(coef) %>%
+               #filter(qval<0.25) %>%
+  subset(metadata=="dGM_NDI_GM_res") %>%
+               ggplot(aes(x=coef,y=reorder(ASV_name, abs_coef), fill=group, color=group, alpha=significant))+ 
+               geom_point(size=2)+
+   geom_errorbar( aes(y=ASV_name, xmin=coef-stderr, xmax=coef+stderr), width=0.05, colour="black", alpha=0.9, size=0.3) +
+               scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_color_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_alpha_discrete(range = c(0.2, 1)) +
+  theme_bw(base_size=13) +
+  theme(axis.text.y = ggtext::element_markdown(size=12), legend.position = "none") + 
+  scale_x_continuous(limits = c(-3,3)) +
+  geom_text(aes(label = star, x=2.8), color="black") +
+  geom_vline(xintercept = 0, col="black")+
+  xlab("Standardised \u03b2 with SE") +ylab("") + ggforce::facet_col(vars(metadata_newname), scales = "free", space = "free") + 
+  theme(
+    strip.placement = "outside", # Place facet labels outside x axis labels.
+    strip.background = element_blank(), # Make facet label background white.
+    legend.position = "none",
+    strip.text.x= element_text(size=12),
+    axis.text.y = ggtext::element_markdown(size=12),
+    #strip.text.y.left = element_text(angle = 0),
+    axis.text.x = element_text(size=9, angle = 45, hjust = 0.7)
+  )
+
+maaslin_dGModi <- all_maaslindf %>% mutate(group = if_else(coef < 0, "Negative effect", "Positive effect")) %>% arrange(coef) %>%
+               #filter(qval<0.25) %>%
+  subset(metadata=="dGM_ODI_GM_res") %>%
+               ggplot(aes(x=coef,y=reorder(ASV_name, abs_coef), fill=group, color=group, alpha=significant))+ 
+               geom_point(size=2)+
+   geom_errorbar( aes(y=ASV_name, xmin=coef-stderr, xmax=coef+stderr), width=0.05, colour="black", alpha=0.9, size=0.3) +
+               scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_color_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_alpha_discrete(range = c(0.2, 1)) +
+  theme_bw(base_size=13) +
+  theme(axis.text.y = ggtext::element_markdown(size=12), legend.position = "none") + 
+  scale_x_continuous(limits = c(-3,3)) +
+  geom_text(aes(label = star, x=2.8), color="black") +
+  geom_vline(xintercept = 0, col="black")+
+  xlab("Standardised \u03b2 with SE") +ylab("") + ggforce::facet_col(vars(metadata_newname), scales = "free", space = "free") + 
+  theme(
+    strip.placement = "outside", # Place facet labels outside x axis labels.
+    strip.background = element_blank(), # Make facet label background white.
+    legend.position = "none",
+    strip.text.x= element_text(size=12),
+    axis.text.y = ggtext::element_markdown(size=12),
+    #strip.text.y.left = element_text(angle = 0),
+    axis.text.x = element_text(size=9, angle = 45, hjust = 0.7)
+  )
+
+maaslin_cGModi <- all_maaslindf %>% mutate(group = if_else(coef < 0, "Negative effect", "Positive effect")) %>% arrange(coef) %>%
+               #filter(qval<0.25) %>%
+  subset(metadata=="cGM_ODI_GM_res") %>%
+               ggplot(aes(x=coef,y=reorder(ASV_name, abs_coef), fill=group, color=group, alpha=significant))+ 
+               geom_point(size=2)+
+   geom_errorbar( aes(y=ASV_name, xmin=coef-stderr, xmax=coef+stderr), width=0.05, colour="black", alpha=0.9, size=0.3) +
+               scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_color_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_alpha_discrete(range = c(0.2, 1)) +
+  theme_bw(base_size=13) +
+  theme(axis.text.y = ggtext::element_markdown(size=12), legend.position = "none") + 
+  scale_x_continuous(limits = c(-3,3)) +
+  geom_text(aes(label = star, x=2.8), color="black") +
+  geom_vline(xintercept = 0, col="black")+
+  xlab("Standardised \u03b2 with SE") +ylab("") + ggforce::facet_col(vars(metadata_newname), scales = "free", space = "free") + 
+  theme(
+    strip.placement = "outside", # Place facet labels outside x axis labels.
+    strip.background = element_blank(), # Make facet label background white.
+    legend.position = "none",
+    strip.text.x= element_text(size=12),
+    axis.text.y = ggtext::element_markdown(size=12),
+    #strip.text.y.left = element_text(angle = 0),
+    axis.text.x = element_text(size=9, angle = 45, hjust = 0.7)
+  )
+
+maaslin_gRD <- all_maaslindf %>% mutate(group = if_else(coef < 0, "Negative effect", "Positive effect")) %>% arrange(coef) %>%
+               #filter(qval<0.25) %>%
+  subset(metadata=="gRD_res") %>%
+               ggplot(aes(x=coef,y=reorder(ASV_name, abs_coef), fill=group, color=group, alpha=significant))+ 
+               geom_point(size=2)+
+   geom_errorbar( aes(y=ASV_name, xmin=coef-stderr, xmax=coef+stderr), width=0.05, colour="black", alpha=0.9, size=0.3) +
+               scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_color_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_alpha_discrete(range = c(0.2, 1)) +
+  theme_bw(base_size=13) +
+  theme(axis.text.y = ggtext::element_markdown(size=12), legend.position = "none") + 
+  scale_x_continuous(limits = c(-3,3)) +
+  geom_text(aes(label = star, x=2.8), color="black") +
+  geom_vline(xintercept = 0, col="black")+
+  xlab("Standardised \u03b2 with SE") +ylab("") + ggforce::facet_col(vars(metadata_newname), scales = "free", space = "free") + 
+  theme(
+    strip.placement = "outside", # Place facet labels outside x axis labels.
+    strip.background = element_blank(), # Make facet label background white.
+    legend.position = "none",
+    strip.text.x= element_text(size=12),
+    axis.text.y = ggtext::element_markdown(size=12),
+    #strip.text.y.left = element_text(angle = 0),
+    axis.text.x = element_text(size=9, angle = 45, hjust = 0.7)
+  )
+
+maaslin_gODI <- all_maaslindf %>% mutate(group = if_else(coef < 0, "Negative effect", "Positive effect")) %>% arrange(coef) %>%
+               #filter(qval<0.25) %>%
+  subset(metadata=="gODI_res") %>%
+               ggplot(aes(x=coef,y=reorder(ASV_name, abs_coef), fill=group, color=group, alpha=significant))+ 
+               geom_point(size=2)+
+   geom_errorbar( aes(y=ASV_name, xmin=coef-stderr, xmax=coef+stderr), width=0.05, colour="black", alpha=0.9, size=0.3) +
+               scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_color_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_alpha_discrete(range = c(0.2, 1)) +
+  theme_bw(base_size=13) +
+  theme(axis.text.y = ggtext::element_markdown(size=12), legend.position = "none") + 
+  scale_x_continuous(limits = c(-3,3)) +
+  geom_text(aes(label = star, x=2.8), color="black") +
+  geom_vline(xintercept = 0, col="black")+
+  xlab("Standardised \u03b2 with SE") +ylab("") + ggforce::facet_col(vars(metadata_newname), scales = "free", space = "free") + 
+  theme(
+    strip.placement = "outside", # Place facet labels outside x axis labels.
+    strip.background = element_blank(), # Make facet label background white.
+    legend.position = "none",
+    strip.text.x= element_text(size=12),
+    axis.text.y = ggtext::element_markdown(size=12),
+    #strip.text.y.left = element_text(angle = 0),
+    axis.text.x = element_text(size=9, angle = 45, hjust = 0.7)
+  )
+
+joint_maaslin_ordered <- ggarrange(maaslin_gRD, maaslin_gODI, maaslin_cGModi, maaslin_dGMfa, maaslin_dGMndi, maaslin_dGModi, ncol=2, nrow=3)
+
+joint_maaslin_ordered
+
+png(file=here("results", "figures", "baseline_microbiota_brain_maaslin_ordered.png"), width = 15, height =8 , units = "in",res=300)
+print(joint_maaslin_ordered)
+dev.off()
+
+
+```

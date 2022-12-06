@@ -1,0 +1,518 @@
+---
+title: "TEBC faecal samples: beta diversity - plots and stats"
+author: 
+  - "Kadi Vaher"
+date: '`r Sys.Date()`'
+output: html_document
+---
+
+```{r setup, include=F, message=F}
+
+library(tidyverse) 
+library(here) 
+library(phyloseq)
+#library(decontam)
+library(RColorBrewer)
+library(knitr)
+library(ggpubr)
+library(vegan)
+library(ggrepel)
+
+# set paths
+knitr::opts_knit$set(root.dir=".", aliases=c(h = "fig.height", w = "fig.width", ow = "out.width"))
+knitr::opts_chunk$set(dev = c('png'), 
+                      fig.path = here("results", "figures", "beta_diversity", ""), dpi = 300)
+theme_set(theme_light()) # global option for ggplot2
+```
+
+# Run the whole document - ONLY AT THE END OF THE WORKSTREAM
+
+```{r knit, echo=F, eval=FALSE}
+rmarkdown::render(input = here("scripts", "16S_beta_diversity.Rmd"), output_dir = here("results", "reports"))
+```
+
+# Load functions
+
+Here load some custom functions which support the analysis below. The scripts for these functions can be found in the `src/`-folder.
+The load_dada is for creating the ASV names, filtering out 'Mitochondria', 'Chloroplast', 'Archae' or 'Eukaryota'
+
+```{r}
+source(here("src", "load_dada.R"))
+source(here("src", "utils_kadi.R"))
+
+```
+
+# Load files
+
+```{r, message = F}
+# load phyloseq object from qc and decontam process
+phy <- readRDS(here("processed_data", "qc_decontam", "ps_final.Rds"))
+phy_RA <- readRDS(here("processed_data", "qc_decontam", "ps_final_RA.Rds"))
+
+#check whether correct files
+ntaxa(phy)
+ntaxa(phy_RA)
+
+```
+
+
+## Beta diversity for the three different sample types
+Visualise how alike two samples are with regard to their (complex) microbiota composition in a simplified manner.
+Dit it based on relative abundances to have normalised count data.
+
+``` {r beta_diversity}
+
+# extracting data from phyloseq object to dataframes
+ASVm <- as(otu_table(phy_RA), "matrix")
+
+# transpose if necessary
+tASVm <- t(ASVm)
+
+# coerce to data.frame
+ASV_raw <- as.data.frame(tASVm)
+
+# calculate bray-curtis dissimilarity matrix
+bc <- vegdist(ASV_raw, method = "bray")
+bc.m <- as.matrix(bc)
+
+bc.m[1:5, 1:5] # visualise first 5 rows and 5 columns; please note the diagonal with 0's for comparisons between same samples.
+
+
+ASV_RA <- otu_table(phy_RA)
+
+# set a random seed as a starting point for the ordination in order to obtain the same result each time you re-run the analysis
+set.seed(37)
+
+# run the ordination
+ordBC <- metaMDS(data.frame(t(ASV_RA)), "bray", trymax=1000, k=5, trace = TRUE, autotransform = F) # if no convergence: try increasing trymax and/or k; could be no convergence is reached regardless
+
+# plot the samples as points in a 2 dimensional space, and draw ellipses around groups of samples according to "group"
+
+meta_final <- phy@sam_data
+
+nMDS <- left_join(meta_final %>% data.frame() %>%
+            mutate(sample.id=as.character(rownames(meta_final))), 
+          ordBC$points %>%
+            data.frame() %>%
+            rownames_to_column("sample.id") %>%
+            select(sample.id, NMDS1=MDS1, NMDS2=MDS2), 
+          by="sample.id")
+
+df_ellipse <- nMDS %>%
+    group_by(type_timepoint) %>% # change; also possible to use two groups
+    do(vegan:::veganCovEllipse(
+      cov.wt(
+        data.frame(NMDS1=.$NMDS1, NMDS2=.$NMDS2))$cov %>% data.frame,
+      center=c(mean(.$NMDS1), mean(.$NMDS2))) %>% data.frame(check.names=F)) %>% 
+    ungroup
+
+p1 <- ggplot(data=nMDS, aes(NMDS1, NMDS2)) + 
+  geom_polygon(data=df_ellipse, aes(x=NMDS1, y=NMDS2, colour=type_timepoint, fill=type_timepoint), show.legend = F) +
+  geom_point(aes(colour = type_timepoint), size=2, alpha=0.8) 
+#p1
+
+# format:
+p1 <- p1 + 
+  scale_color_manual(name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-discharge"), values=alpha(c("#1B9E77", "#FDC46B", "#7570B3"), 1)) +
+  scale_fill_manual(name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-discharge"), values=alpha(c("#1B9E77", "#FDC46B", "#7570B3"), 0.5)) +
+  theme_bw(base_size=13) +
+  theme(legend.position = "bottom", aspect.ratio = 1)
+p1
+
+
+```
+
+``` {r nmds_function}
+
+plot_nMDS <- function(nMDS, group, cols, ...)  {
+  df_ellipse <- nMDS %>%
+    group_by({{group}}) %>% # change; also possible to use two groups
+    do(vegan:::veganCovEllipse(
+      cov.wt(
+        data.frame(NMDS1=.$NMDS1, NMDS2=.$NMDS2))$cov %>% data.frame,
+      center=c(mean(.$NMDS1), mean(.$NMDS2))) %>% data.frame(check.names=F)) %>% 
+    ungroup
+
+p1 <- ggplot(data=nMDS, aes(NMDS1, NMDS2)) + 
+  geom_polygon(data=df_ellipse, aes(x=NMDS1, y=NMDS2, colour={{group}}, fill={{group}}), show.legend = F) +
+  geom_point(aes(colour = {{group}}), size=2, alpha=0.8) +
+  scale_color_manual(..., values=alpha(cols, 1)) +
+  scale_fill_manual(..., values=alpha(cols, 0.4)) +
+  theme_bw(base_size=15) +
+  theme(legend.position = "bottom", aspect.ratio = 1)
+p1
+}
+
+```
+
+#### Type of sample
+
+```{r type_nmdes, w = 5.3, h = 6, ow = '55%'}
+
+type_nmdsplot <- plot_nMDS(nMDS, type_timepoint, cols=c("#1B9E77", "#FDC46B", "#7570B3"), name="", labels=c("Term\nmeconium", "Preterm\nmeconium", "Preterm\npre-discharge"))
+
+type_nmdsplot
+
+png(file=here("results", "figures", "sampletype_nmds_plot.png"), width = 5, height = 5, units = "in",res=300)
+print(type_nmdsplot)
+dev.off()
+
+#add species info
+n_species <- 10
+format_labels <- function(x) {
+  sapply(strsplit(x, "_"), function(y) {
+    paste(paste(head(y, n=-1), collapse=" "), paste0("[", tail(y, n=1), "]"), collapse=" ") } )
+}
+
+text_nmds <- ordBC$species %>%
+  data.frame() %>%
+  rownames_to_column("unformatted_labels") %>%
+  slice(1:n_species) %>%
+  mutate(labels=format_labels(unformatted_labels))
+
+type_nmdsplot2 <- type_nmdsplot + 
+  geom_point(data=text_nmds, aes(x=MDS1, y=MDS1), shape=17, size=4, alpha=0.5, inherit.aes = F) + 
+  geom_text_repel(data=text_nmds, aes(x=MDS1, y=MDS1, label=labels), fontface=3, size=3.5, inherit.aes = F)
+type_nmdsplot2
+
+```
+
+# PERMANOVAs for sample type
+
+Here do adonis for the sample types by subsetting the distance matrix instead of recalculating the dissimilarity matrix itself
+
+```{r stats_norecalc}
+
+#first make bc.m into a dataframe
+
+bc.df <- as.data.frame(bc.m)
+
+#######################################################
+#subset to only meconium samples
+mec_df <-  meta_final %>% subset(Visit_number=="V1")
+bc.mec.df <- bc.df %>% subset(row.names(bc.df) %in% row.names(mec_df)) %>% select(one_of(row.names(mec_df)))
+bc.mec.m <- as.matrix(bc.mec.df)
+
+mec_df <- mec_df %>% data.frame() %>%
+            mutate(sample.id=as.character(rownames(mec_df)))
+
+#check if are in the same order
+all(rownames(bc.mec.m)==rownames(mec_df))
+
+#run stats
+set.seed(27)
+adonis2(bc.mec.m ~ preterm, mec_df, permutations = 1000)
+
+######################################################
+#do the same for preterm samples only
+preterm_df <-  meta_final %>% subset(preterm==1)
+bc.preterm.df <- bc.df %>% subset(row.names(bc.df) %in% row.names(preterm_df)) %>% select(one_of(row.names(preterm_df)))
+bc.preterm.m <- as.matrix(bc.preterm.df)
+
+preterm_df <- preterm_df %>% data.frame() %>%
+            mutate(sample.id=as.character(rownames(preterm_df)))
+
+#check if are in the same order
+all(rownames(bc.preterm.m)==rownames(preterm_df))
+all(colnames(bc.preterm.m)==rownames(preterm_df))
+
+#run stats
+set.seed(27)
+adonis2(bc.preterm.m ~ Visit_number, preterm_df, strata = preterm_df$record_id, permutations = 1000)
+
+#######################################################
+#do the same for term mec vs preterm pre-discharge samples
+tea_df <- meta_final %>% subset(type_timepoint=="1_V2" | type_timepoint=="0_V1")
+
+bc.tea.df <- bc.df %>% subset(row.names(bc.df) %in% row.names(tea_df)) %>% select(one_of(row.names(tea_df)))
+bc.tea.m <- as.matrix(bc.tea.df)
+
+tea_df <- tea_df %>% data.frame() %>%
+            mutate(sample.id=as.character(rownames(tea_df)))
+
+#check if are in the same order
+all(rownames(bc.tea.m)==rownames(tea_df))
+all(colnames(bc.tea.m)==rownames(tea_df))
+
+#run stats
+set.seed(27)
+adonis2(bc.tea.m ~ type_timepoint, tea_df, permutations = 1000)
+
+
+```
+
+# Permanovas for other perinatal variables
+Do this only for the preterm samples (as I only have 12 term meconium samples in the final dataset)
+Focus the analyses separately for meconium and pre-discharge samples to also understand the temporal effects, and to avoid repeated measures; this also allows to test for variables that I think could become important over the course of development in NNU instead of only birth/early days related factors.
+
+
+First need to read in the clinical variables data, filter and merge with the phyloseq object (maybe not necessary to merge??)
+
+```{r demodata}
+
+all_samples_demo <- read.csv(here("processed_data", "demographics_microbiome_samples_250_01092022.csv"), header=T)
+
+qc_demo <- read.csv(here("processed_data", "metadata_qc_decontam_23082022.csv"), header=T)
+qc_demo <- qc_demo %>% subset(sample_type=="sample") %>% select(-record_id, -Time_point, -Visit_number, -preterm, -GA_birth, -postnatal_age_at_sample_d, -PMA_sample_w, -cos_excluded_options)
+
+demo <- merge(qc_demo, all_samples_demo, by="sample_id", all.x=T)
+
+demo <- demo %>% subset(sample_work_nr %in% rownames(sample_data(phy)))
+
+
+```
+
+## Meconium samples
+Subset to preterm meconium samples
+Remove taxa that are not present in the samples
+
+```{r mec_permanovas}
+
+phy_preterm_mec <- phy %>% subset_samples((Visit_number=="V1" & preterm=="1")) %>% 
+  prune_taxa(taxa_sums(.) > 0, .)
+
+demo_preterm_mec <- demo %>% subset(Visit_number=="V1" & preterm=="1")
+
+phy_preterm_mec_RA <- phy_preterm_mec %>% to_RA
+
+# extracting data from phyloseq object to dataframes
+ASVm_preterm_mec <- as(otu_table(phy_preterm_mec_RA), "matrix")
+
+# transpose
+tASVm_preterm_mec <- t(ASVm_preterm_mec)
+
+# coerce to data.frame
+ASV_raw_ASVm_preterm_mec <- as.data.frame(tASVm_preterm_mec)
+
+# calculate bray-curtis dissimilarity matrix
+bc_preterm_mec <- vegdist(ASV_raw_ASVm_preterm_mec, method = "bray")
+
+bc.m_preterm_mec <- as.matrix(bc_preterm_mec)
+
+bc.m_preterm_mec[1:5, 1:5]
+
+#match the order of demo data with that in the phyloseq object
+demo_preterm_mec=demo_preterm_mec[match(rownames(sample_data(phy_preterm_mec_RA)),demo_preterm_mec$sample_work_nr),]
+all(demo_preterm_mec$sample_work_nr==rownames(sample_data(phy_preterm_mec_RA)))
+
+demo_preterm_mec <- demo_preterm_mec %>% data.frame() %>%
+            mutate(sample.id=sample_work_nr)
+
+#Make a loop in order to put the permanova results into a table
+
+results_preterm_mec <- data.frame(matrix(ncol = 3, nrow = 0))
+x <- c("variable_name", "R2", "pvalue")
+colnames(results_preterm_mec) <- x
+
+#list of variables to test
+variables_preterm_mec <- c("extremely_preterm", "postnatal_age_at_sample_d", "PMA_sample_w", "sex", "Vaginal_delivery",
+                             "labour_antibiotics", "AB_before72h", 
+                             "birthweight_g", "birthweight_z_score")
+
+
+for(var in 1:length(variables_preterm_mec)){
+  variable <-variables_preterm_mec[var]
+  #print(variable)
+  formula <- as.formula(paste("bc_preterm_mec", variable, sep="~"))
+  print(formula)
+  set.seed(27) #setting a seed as otherwise every time the permutations are a bit different so p-values will be different
+  model <- adonis2(formula, demo_preterm_mec, permutations = 1000)
+  print(model)
+  
+  tmp <-data.frame(matrix(ncol = 3, nrow = 1))
+  y <- c("variable_name", "R2", "pvalue")
+  colnames(tmp) <- y
+
+  tmp$R2 <- model$R2[1]
+  tmp$pvalue <- model$Pr[1]
+  tmp$variable_name <- rownames(model)[1]
+  #print(tmp)
+  results_preterm_mec <- rbind(results_preterm_mec, tmp)
+}
+
+#do p-value adjustment
+results_preterm_mec$adj_pval <- p.adjust(results_preterm_mec$pvalue, method="BH")
+
+kable(results_preterm_mec)
+
+write.csv(results_preterm_mec, here("results", "tables", "betadiv_mec_stats.csv"), row.names=F)
+
+
+```
+
+## Pre-discharge samples
+Subset to preterm pre-discharge samples
+Remove taxa that are not present in the samples
+
+```{r disch_permanovas}
+
+phy_preterm_disch <- phy %>% subset_samples((Visit_number=="V2" & preterm=="1")) %>% 
+  prune_taxa(taxa_sums(.) > 0, .)
+
+demo_preterm_disch <- demo %>% subset(Visit_number=="V2" & preterm=="1")
+
+#transfrom to RA
+phy_preterm_disch_RA <- phy_preterm_disch %>% to_RA
+
+# extracting data from phyloseq object to dataframes
+ASVm_preterm_disch <- as(otu_table(phy_preterm_disch_RA), "matrix")
+
+# transpose
+tASVm_preterm_disch <- t(ASVm_preterm_disch)
+
+# coerce to data.frame
+ASV_raw_ASVm_preterm_disch <- as.data.frame(tASVm_preterm_disch)
+
+# calculate bray-curtis dissimilarity matrix
+bc_preterm_disch <- vegdist(ASV_raw_ASVm_preterm_disch, method = "bray")
+
+bc.m_preterm_disch <- as.matrix(bc_preterm_disch)
+
+bc.m_preterm_mec[1:5, 1:5]
+
+#match the order of demo data with that in the phyloseq object
+demo_preterm_disch=demo_preterm_disch[match(rownames(sample_data(phy_preterm_disch_RA)),demo_preterm_disch$sample_work_nr),]
+all(demo_preterm_disch$sample_work_nr==rownames(sample_data(phy_preterm_disch_RA)))
+
+demo_preterm_disch <- demo_preterm_disch %>% data.frame() %>%
+            mutate(sample.id=sample_work_nr)
+
+
+#Make a loop in order to put the permanova results into a table
+
+results_preterm_disch <- data.frame(matrix(ncol = 3, nrow = 0))
+x <- c("variable_name", "R2", "pvalue")
+colnames(results_preterm_disch) <- x
+
+
+#variable list to test for pre-discharge samples
+variables_preterm_disch <- c("extremely_preterm", "postnatal_age_at_sample_d", "PMA_sample_w", "sex", "Vaginal_delivery",
+                             "labour_antibiotics", "AB_before72h", "AB_after72h", "prop_abx_totaldays",
+                             "birthweight_g", "birthweight_z_score", "sepsis_binary", "nec_binary",
+                             "bronchopulmonary_dysplasia", "BM_75")
+
+#results$variable_name <- variables
+
+for(var in 1:length(variables_preterm_disch)){
+  variable <-variables_preterm_disch[var]
+  #print(variable)
+  formula <- as.formula(paste("bc_preterm_disch", variable, sep="~"))
+  print(formula)
+  set.seed(27) #setting a seed as otherwise every time the permutations are a bit different so p-values will be different
+  model <- adonis2(formula, demo_preterm_disch, permutations = 1000)
+  print(model)
+  
+  tmp <-data.frame(matrix(ncol = 3, nrow = 1))
+  y <- c("variable_name", "R2", "pvalue")
+  colnames(tmp) <- y
+
+  tmp$R2 <- model$R2[1]
+  tmp$pvalue <- model$Pr[1]
+  tmp$variable_name <- rownames(model)[1]
+  #print(tmp)
+  results_preterm_disch <- rbind(results_preterm_disch, tmp)
+}
+
+#do p-value adjustment
+results_preterm_disch$adj_pval <- p.adjust(results_preterm_disch$pvalue, method="BH")
+
+kable(results_preterm_disch)
+
+write.csv(results_preterm_disch, here("results", "tables", "betadiv_disch_stats.csv"), row.names=F)
+
+
+```
+
+
+## Do some plotting of the effects
+
+mode of delivery (without recalculating the bray-curtis matrix -> use the same ordination as the very first sample type plot)
+
+```{r nmds_modedelivery_norecalc}
+
+
+demo_preterms <- rbind(demo_preterm_disch, demo_preterm_mec)
+
+nMDS_preterms_mec <- merge(demo_preterms %>% data.frame() %>% subset(Visit_number=="V1") %>%
+            mutate(sample.id=sample_work_nr), 
+          ordBC$points %>%
+            data.frame() %>%
+            rownames_to_column("sample.id") %>%
+            select(sample.id, NMDS1=MDS1, NMDS2=MDS2), 
+          by="sample.id", all.x=T)
+
+nMDS_preterms_disch <- merge(demo_preterms %>% data.frame() %>% subset(Visit_number=="V2") %>%
+            mutate(sample.id=sample_work_nr), 
+          ordBC$points %>%
+            data.frame() %>%
+            rownames_to_column("sample.id") %>%
+            select(sample.id, NMDS1=MDS1, NMDS2=MDS2), 
+          by="sample.id", all.x=T)
+
+nMDS_preterms_mec$Vaginal_delivery <- as.factor(nMDS_preterms_mec$Vaginal_delivery)
+nMDS_preterms_disch$Vaginal_delivery <- as.factor(nMDS_preterms_disch$Vaginal_delivery)
+
+mec_modedelivery <- plot_nMDS(nMDS_preterms_mec, Vaginal_delivery, cols=c("#036268", "#9BC6A7"), name="Mode of delivery", labels=c("C-section", "Vaginal birth"))
+disch_modedelivery <- plot_nMDS(nMDS_preterms_disch, Vaginal_delivery, cols=c("#036268", "#9BC6A7"), name="Mode of delivery", labels=c("C-section", "Vaginal birth"))
+
+joint_nmds_modedelivery <- ggarrange(mec_modedelivery, disch_modedelivery, nrow=1, common.legend=T, legend="bottom", labels=c("Meconium", "Pre-discharge"))
+
+joint_nmds_modedelivery
+
+png(file=here("results", "figures", "deliverymode_nmds_plot.png"), width = 6.6, height = 4, units = "in",res=300)
+print(joint_nmds_modedelivery)
+dev.off()
+
+
+
+```
+sex
+
+```{r sex_nmds}
+
+nMDS_preterms_mec$sex <- as.factor(nMDS_preterms_mec$sex)
+nMDS_preterms_disch$sex <- as.factor(nMDS_preterms_disch$sex)
+
+mec_sex <- plot_nMDS(nMDS_preterms_mec, sex, cols=c("#5179C3", "#D890B1"), name="Sex", labels=c("Male", "Female"))
+disch_sex <- plot_nMDS(nMDS_preterms_disch, sex, cols=c("#5179C3", "#D890B1"), name="Sex", labels=c("Male", "Female"))
+
+joint_nmds_sex <- ggarrange(mec_sex, disch_sex, nrow=1, common.legend=T, legend="bottom", labels=c("Meconium", "Pre-discharge"))
+
+joint_nmds_sex
+
+png(file=here("results", "figures", "sex_nmds_plot.png"), width = 6.6, height = 4, units = "in",res=300)
+print(joint_nmds_sex)
+dev.off()
+
+```
+
+
+# For pre-discharge samples, look into the feeding variables for some descriptives
+
+```{r disch_extra}
+
+#MOM
+
+#make a variable to say if baby got any MOM during NNU stay: this then includes all mixed feeding days too
+demo_preterm_disch <- demo_preterm_disch %>% mutate(any_MOM_days = days_excl_mbm + days_excl_mbm_af + days_excl_mbm_debm)
+hist(demo_preterm_disch$any_MOM_days)
+kable(table(demo_preterm_disch$any_MOM_days)) # -> we only have 2 infants who never got any MOM during NNU stay
+
+
+demo_preterm_disch <- demo_preterm_disch %>% mutate(prop_any_MOM = any_MOM_days/days_nnu)
+hist(demo_preterm_disch$prop_any_MOM)
+median(demo_preterm_disch$prop_any_MOM) #most infants got some MOM during NNU stay
+
+
+demo_preterm_disch <- demo_preterm_disch %>% mutate(prop_bm_mom_or_momdebm = (days_excl_mbm + days_excl_mbm_debm)/days_nnu)
+hist(demo_preterm_disch$prop_bm_mom_or_momdebm)
+median(demo_preterm_disch$prop_bm_mom_or_momdebm)
+
+
+#any formula ??
+demo_preterm_disch <- demo_preterm_disch %>% mutate(any_formula_days = days_excl_formula + days_excl_mbm_af + days_excl_debm_af)
+hist(demo_preterm_disch$any_formula_days)
+kable(table(demo_preterm_disch$any_formula_days)) #have 35 infants not exposed to formula at all
+
+```
+

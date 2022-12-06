@@ -1,0 +1,323 @@
+---
+title: "TEBC pre-discharge faecal samples: microbiota associations with dGM regional diffusion measures"
+author: 
+  - "Kadi Vaher"
+date: '`r Sys.Date()`'
+output: html_document
+---
+
+```{r setup, include=F, message=F}
+
+library(tidyverse) 
+library(here) 
+library(RColorBrewer)
+library(knitr)
+library(ggpubr)
+library(vegan)
+library(ggrepel)
+library(ape)
+library(Hmisc)
+library(corrplot)
+library(car)
+
+# set paths
+knitr::opts_knit$set(root.dir=".", aliases=c(h = "fig.height", w = "fig.width", ow = "out.width"))
+knitr::opts_chunk$set(dev = c('png'), 
+                      fig.path = here("results", "figures", "mb_brain_models", "dGM_regionaldiff_microbiome_stats", ""), dpi = 300)
+theme_set(theme_light()) # global option for ggplot2
+
+```
+
+# Run the whole document - ONLY AT THE END OF THE WORKSTREAM
+
+```{r knit, echo=F, eval=FALSE}
+rmarkdown::render(input = here("scripts", "dGM_regionaldiff_microbiome_stats.Rmd"), output_dir = here("results", "reports"))
+```
+
+# Put the dGM regional diffusion measures into one big file
+
+```{r organise_dGM_data}
+
+#start a table with all record_ids
+dat <- read.csv(here("imaging_data", "raw_data", "dGM_diffusion", "Kadi_GM_FA.csv"))
+
+diff_measures <- dat %>% select(record_id)
+
+#now in loop read in all the data files containing regional diffusion measures for the dGM structures
+
+metrics <- c("GM_FA", "GM_RD")
+
+for(i in 1:length(metrics)){
+  metric <- metrics[i]
+  print(metric)
+  dat <- read.csv(here("imaging_data", "raw_data", "dGM_diffusion", paste("Kadi_", metric, ".csv", sep="")))
+  dat <- dat %>% rename(thalamus=thalamu)
+  newnames <- paste(colnames(dat[2:ncol(dat)]), metric, sep="_")
+  colnames(dat) <- c("record_id", newnames)
+  diff_measures <- merge(diff_measures, dat, by="record_id")
+}        
+
+#also add the NODDI measures
+
+metrics <- c("NDI", "ODI", "ISO")
+
+for(i in 1:length(metrics)){
+  metric <- metrics[i]
+  print(metric)
+  dat <- read.csv(here("imaging_data", "raw_data", "dGM_diffusion", paste("GM_optimalvalues_", metric, ".csv", sep="")))
+  dat <- dat %>% rename(thalamus=thalamu)
+  newnames <- paste(colnames(dat[2:ncol(dat)]), metric, sep="_")
+  colnames(dat) <- c("record_id", newnames)
+  diff_measures <- merge(diff_measures, dat, by="record_id")
+}   
+
+
+#remove the GM from column names
+colnames(diff_measures)<-gsub("GM_","",colnames(diff_measures))
+
+```
+
+# Now load the microbiota metrics files and merge all together
+
+```{r merge_files}
+
+#load files
+demo_matching <- read.csv(here("processed_data", "demographics_microbiome_mri_79_10102022.csv"))
+demo_final_samples <- read.csv(here("processed_data", "demographics_clusterinfo_finalsamples_04102022.csv"))
+pcoa <- read.csv(here("processed_data", "matchingsample_pcoa_relativeabundances.csv"))
+
+#wrangle the microbiota metrics files
+alpha <- demo_final_samples %>% select(sample_work_nr, Observed_rarefied, Shannon_rarefied)
+pcoa <- pcoa %>% rename(sample_work_nr = X)
+all_microbiota_matching <- merge(alpha, pcoa, by="sample_work_nr", all.y=T)
+
+#subset the brain data to only include the infants with matching microbiota
+diff_measures <- diff_measures %>% subset(record_id %in% demo_matching$record_id)
+
+#select important demographics info
+imp_demo <- demo_matching %>% select(record_id, sample_id, sample_work_nr, Time_point, Visit_number, GA_birth, extremely_preterm, postnatal_age_at_sample_d, PMA_sample_w, sex, GA_mri, birthweight_z_score, sepsis_binary, nec_binary, Vaginal_delivery, AB_after72h, BM_75)
+
+#merge all data together
+all_data <- merge(imp_demo, diff_measures, by="record_id", all.x=T)
+all_data <- merge(all_data, all_microbiota_matching, by="sample_work_nr")
+
+
+```
+
+# Residualise the microbiota features against age at sample collection
+
+```{r residualise}
+
+all_data_resid <- all_data %>% mutate(Axis.1_res = resid(lm(scale(Axis.1) ~ scale(PMA_sample_w), data=all_data)),
+                                        Axis.2_res = resid(lm(scale(Axis.2) ~ scale(PMA_sample_w), data=all_data)),
+                                        Axis.3_res = resid(lm(scale(Axis.3) ~ scale(PMA_sample_w), data=all_data)),
+                                        Axis.4_res = resid(lm(scale(Axis.4) ~ scale(PMA_sample_w), data=all_data)),
+                                        Shannon_rarefied_res = resid(lm(scale(Shannon_rarefied) ~ scale(PMA_sample_w), data=all_data)),
+                                        Observed_rarefied_res = resid(lm(scale(Observed_rarefied) ~ scale(PMA_sample_w), data=all_data)))
+
+```
+
+# Baseline model: adjusted for GA at birth and GA at scan (using residualised (against PMA at sample collection) microbiota features)
+
+```{r baseline_model}
+
+results_table <- data.frame(matrix(ncol = 16, nrow = 0))
+x <- c("Microbiota_metric", "Brain_feature", "beta", "se","pval", "GAbirth_beta", "GAbirth_se", "GAbirth_pval", "GAmri_beta", "GAmri_se", "GAmri_pval", "multiple_r2_baseline", "adj_r2_baseline", "multiple_r2_model", "adj_r2_model", "model_diff_pval")
+colnames(results_table) <- x
+
+for (j in 176:181) {
+  #
+  microbiota_metric <- print(names(all_data_resid[j]))
+
+  for (i in 18:42) {
+    #
+    brain_feature <- print(names(all_data_resid[i]))
+    fit <- lm(scale(all_data_resid[[i]]) ~ scale(all_data_resid[[j]]) + scale(GA_birth) + scale(GA_mri), data = all_data_resid)
+    fit_baseline <- lm(scale(all_data_resid[[i]]) ~ scale(GA_birth) + scale(GA_mri), data = all_data_resid)
+    print(summary(fit))
+    print(summary(fit_baseline))
+    print(anova(fit_baseline, fit))
+
+    #test if model residuals normally distributed
+    print(shapiro.test(fit[['residuals']]))
+    #print(bptest(fit))
+    #qqPlot(fit$residuals)
+    par(mfrow = c(2, 2))
+    plot(fit)
+    par(mfrow=c(1,1))
+    
+    tmp <- data.frame(matrix(ncol = 16, nrow = 1))
+    y <- c("Microbiota_metric", "Brain_feature", "beta", "se","pval", "GAbirth_beta", "GAbirth_se", "GAbirth_pval", "GAmri_beta", "GAmri_se", "GAmri_pval", "multiple_r2_baseline", "adj_r2_baseline", "multiple_r2_model", "adj_r2_model", "model_diff_pval")
+    colnames(tmp) <- y
+    tmp$Microbiota_metric <- microbiota_metric
+    tmp$Brain_feature <- brain_feature
+    tmp$beta <- fit$coefficients[2]
+    tmp$se <- summary(fit)$coefficients[2,2]
+    tmp$pval <- summary(fit)$coefficients[2,4]
+    
+    tmp$GAbirth_beta <- fit$coefficients[3]
+    tmp$GAbirth_se <- summary(fit)$coefficients[3,2]
+    tmp$GAbirth_pval <- summary(fit)$coefficients[3,4]
+    
+    tmp$GAmri_beta <- fit$coefficients[4]
+    tmp$GAmri_se <- summary(fit)$coefficients[4,2]
+    tmp$GAmri_pval <- summary(fit)$coefficients[4,4]
+    
+    tmp$multiple_r2_baseline <- summary(fit_baseline)$r.squared
+    tmp$adj_r2_baseline <- summary(fit_baseline)$adj.r.squared
+    tmp$multiple_r2_model <- summary(fit)$r.squared
+    tmp$adj_r2_model <- summary(fit)$adj.r.squared
+    tmp$model_diff_pval <- anova(fit_baseline, fit)[2,6]
+    
+    results_table <- rbind(results_table, tmp)
+    
+  }
+}
+
+results_table$adj_pval <- p.adjust(results_table$pval, method="BH")
+
+#calculate incremental R2
+results_table <- results_table %>% mutate(diff_multiple_r2 = multiple_r2_model - multiple_r2_baseline,
+                                                          diff_adj_r2 = adj_r2_model - adj_r2_baseline)
+
+kable(results_table)
+
+write.csv(results_table, here("results", "tables", "microbiota_dGMmicrostructure_baselinemodel.csv"), row.names=F)
+
+
+#only keep the PCo2 and observed species results as those were the only ones significant in the main global dGM analysis
+#also remove ISO as this was not significant
+#also remove any analysis done with the background
+
+results_table2 <- results_table %>% subset(Microbiota_metric %in% c("Axis.2_res", "Observed_rarefied_res"))
+results_table2 <- results_table2[- grep("background", results_table2$Brain_feature), ]
+results_table2 <- results_table2[- grep("ISO", results_table2$Brain_feature), ]
+results_table2 <- results_table2[- grep("RD", results_table2$Brain_feature), ]
+
+results_table2$adj_pval <- p.adjust(results_table2$pval, method="BH")
+
+write.csv(results_table2, here("results", "tables", "microbiota_dGMmicrostructure_baselinemodel_PCo2_Observed.csv"), row.names=F)
+
+```
+
+## Figure
+
+```{r figure_baseline, ow="50%"}
+
+#wrangle the results file to organise the feature groups
+
+results_table <- results_table %>% mutate(
+  brain_group = case_when(grepl("caudate",Brain_feature) ~ "Caudate",
+                          grepl("subthalamic",Brain_feature) ~ "Subthalamic nucleus",
+                          grepl("lentiform",Brain_feature) ~ "Lentiform nucleus",
+                          grepl("thalamus",Brain_feature) ~ "Thalamus",
+                          grepl("background",Brain_feature) ~ "Background"))
+
+results_table <- results_table %>% mutate(star = ifelse(adj_pval < 0.25, "*", ""),
+                                          significant = ifelse(pval < 0.05, "yes", "no"))
+
+results_table <- results_table %>% mutate(Microbiota_metric_renamed = case_when(Microbiota_metric=="Axis.1_res" ~ "PCo1",
+                                                                                Microbiota_metric=="Axis.2_res" ~  "PCo2",
+                                                                                Microbiota_metric=="Axis.3_res" ~  "PCo3",
+                                                                                Microbiota_metric=="Axis.4_res" ~  "PCo4",
+                                                                                Microbiota_metric=="Observed_rarefied_res" ~  "Observed species",
+                                                                                Microbiota_metric=="Shannon_rarefied_res" ~  "Shannon index"))
+
+results_table$Microbiota_metric_renamed <- as.factor(results_table$Microbiota_metric_renamed)
+results_table$Microbiota_metric_renamed <- factor(results_table$Microbiota_metric_renamed, levels = c("PCo1","PCo2","PCo3","PCo4","Observed species","Shannon index"))
+
+results_table$Brain_feature <- as.factor(results_table$Brain_feature)
+#results_table$Brain_feature <- factor(results_table$Brain_feature, levels = c("caudate_FA","subthalamic_FA","lentiform_FA","thalamus_FA","caudate_RD","subthalamic_RD","lentiform_RD","thalamus_RD","caudate_NDI","subthalamic_NDI","lentiform_NDI","thalamus_NDI","caudate_ODI","subthalamic_ODI","lentiform_ODI","thalamus_ODI","caudate_ISO","subthalamic_ISO","lentiform_ISO","thalamus_ISO"))
+
+results_table$Brain_feature <- factor(results_table$Brain_feature, levels = c("background_FA", "caudate_FA","subthalamic_FA","lentiform_FA","thalamus_FA","background_RD", "caudate_RD","subthalamic_RD","lentiform_RD","thalamus_RD","background_NDI", "caudate_NDI","subthalamic_NDI","lentiform_NDI","thalamus_NDI","background_ODI", "caudate_ODI","subthalamic_ODI","lentiform_ODI","thalamus_ODI","background_ISO", "caudate_ISO","subthalamic_ISO","lentiform_ISO","thalamus_ISO"))
+
+
+
+fig_baseline <- results_table %>% mutate(group = if_else(beta < 0, "Negative effect", "Positive effect")) %>%
+               #filter(qval<0.25) %>%
+               ggplot(aes(x=beta,y=Brain_feature, fill=group, alpha=significant, color=group))+ 
+               geom_point(size=3, aes(color=group, fill=group))+
+   geom_errorbar( aes(y=Brain_feature, xmin=beta-se, xmax=beta+se), width=0.3, colour="black", alpha=0.9, size=0.4) +
+               scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_color_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_alpha_discrete(range = c(0.2, 1)) +
+  theme_bw(base_size=13) +
+  theme(axis.text.y = ggtext::element_markdown(size=12), legend.position = "none") + 
+  scale_x_continuous(limits = c(-0.5,0.5)) +
+  geom_text(aes(label = star, x=0.45), color="black") +
+  geom_vline(xintercept = 0, col="dark gray", linetype="dashed")+
+  xlab("Standardised \u03b2 with SE") +ylab("") + facet_grid(brain_group ~ Microbiota_metric_renamed, scales="free", space="free", switch = "y") + theme(
+    strip.placement = "outside", # Place facet labels outside x axis labels.
+    strip.background = element_blank(), # Make facet label background white.
+    legend.position = "none",
+    strip.text.y.left = element_text(angle = 0, size=12),
+    strip.text.x = element_text(angle = 0, size=12),
+    axis.text.x = element_text(size=9, angle = 45, hjust = 0.7)
+  ) +
+  scale_y_discrete(limits=rev)
+
+fig_baseline
+
+png(file=here("results", "figures", "baseline_microbiota_dGM_microstructure.png"), width = 17, height =6 , units = "in",res=300)
+print(fig_baseline)
+dev.off()
+
+
+#####################
+#figure only for the PCo2 and observed species (those that were significant from the global dGM analysis)
+
+results_table2 <- results_table2 %>% mutate(
+  brain_group = case_when(grepl("caudate",Brain_feature) ~ "Caudate",
+                          grepl("subthalamic",Brain_feature) ~ "Subthalamic nucleus",
+                          grepl("lentiform",Brain_feature) ~ "Lentiform nucleus",
+                          grepl("thalamus",Brain_feature) ~ "Thalamus",
+                          grepl("background",Brain_feature) ~ "Background"))
+
+results_table2 <- results_table2 %>% mutate(star = ifelse(adj_pval < 0.05, "*", ""),
+                                          significant = ifelse(pval < 0.05, "yes", "no"))
+
+results_table2 <- results_table2 %>% mutate(Microbiota_metric_renamed = case_when(Microbiota_metric=="Axis.1_res" ~ "PCo1",
+                                                                                Microbiota_metric=="Axis.2_res" ~  "PCo2",
+                                                                                Microbiota_metric=="Axis.3_res" ~  "PCo3",
+                                                                                Microbiota_metric=="Axis.4_res" ~  "PCo4",
+                                                                                Microbiota_metric=="Observed_rarefied_res" ~  "Observed species",
+                                                                                Microbiota_metric=="Shannon_rarefied_res" ~  "Shannon index"))
+
+results_table2$Microbiota_metric_renamed <- as.factor(results_table2$Microbiota_metric_renamed)
+results_table2$Microbiota_metric_renamed <- factor(results_table2$Microbiota_metric_renamed, levels = c("PCo1","PCo2","PCo3","PCo4","Observed species","Shannon index"))
+
+results_table2$Brain_feature <- as.factor(results_table2$Brain_feature)
+
+results_table2$Brain_feature <- factor(results_table2$Brain_feature, levels = c("background_FA", "caudate_FA","subthalamic_FA","lentiform_FA","thalamus_FA","background_RD", "caudate_RD","subthalamic_RD","lentiform_RD","thalamus_RD","background_NDI", "caudate_NDI","subthalamic_NDI","lentiform_NDI","thalamus_NDI","background_ODI", "caudate_ODI","subthalamic_ODI","lentiform_ODI","thalamus_ODI","background_ISO", "caudate_ISO","subthalamic_ISO","lentiform_ISO","thalamus_ISO"))
+
+
+fig_baseline2 <- results_table2 %>% mutate(group = if_else(beta < 0, "Negative effect", "Positive effect")) %>%
+               #filter(qval<0.25) %>%
+               ggplot(aes(x=beta,y=Brain_feature, fill=group, alpha=significant, color=group))+ 
+               geom_point(size=3, aes(color=group, fill=group))+
+   geom_errorbar( aes(y=Brain_feature, xmin=beta-se, xmax=beta+se), width=0.3, colour="black", alpha=0.9, size=0.4) +
+               scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_color_manual(values=c("#34487A", "#CF5A47"), name="") +
+  scale_alpha_discrete(range = c(0.2, 1)) +
+  theme_bw(base_size=13) +
+  theme(axis.text.y = ggtext::element_markdown(size=12), legend.position = "none") + 
+  scale_x_continuous(limits = c(-0.5,0.5)) +
+  geom_text(aes(label = star, x=0.45), color="black") +
+  geom_vline(xintercept = 0, col="dark gray", linetype="dashed")+
+  xlab("Standardised \u03b2 with SE") +ylab("") + facet_grid(brain_group ~ Microbiota_metric_renamed, scales="free", space="free", switch = "y") + theme(
+    strip.placement = "outside", # Place facet labels outside x axis labels.
+    strip.background = element_blank(), # Make facet label background white.
+    legend.position = "none",
+    strip.text.y.left = element_text(angle = 0, size=12),
+    strip.text.x = element_text(angle = 0, size=12),
+    axis.text.x = element_text(size=9, angle = 45, hjust = 0.7)
+  ) +
+  scale_y_discrete(limits=rev)
+
+fig_baseline2
+
+png(file=here("results", "figures", "baseline_microbiota_dGM_microstructure_PCo2_Observed.png"), width = 9, height =6 , units = "in",res=300)
+print(fig_baseline2)
+dev.off()
+
+```

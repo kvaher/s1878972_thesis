@@ -1,0 +1,618 @@
+---
+title: "hclust_clean"
+author: "Kadi Vaher"
+date: "09/08/2022"
+output: html_document
+---
+---
+title: "TEBC faecal samples: Clustering of the samples (hierarchical)"
+author: 
+  - "Kadi Vaher"
+  - "Hierarchical clustering with all samples together"
+  - "Based on Bray-Curtis dissimilarity matrix calculated on the TSS-normalised ASV table (relative abundances)"
+date: '`r Sys.Date()`'
+output: html_document
+---
+
+```{r setup, include=F, message=F}
+
+library(tidyverse) 
+library(here) 
+library(phyloseq)
+library(decontam)
+library(RColorBrewer)
+library(knitr)
+library(ggpubr)
+library(vegan)
+library(ggrepel)
+
+#packages for hierarchical clustering
+library(fpc)
+library(ggdendro)
+library(dendextend)
+
+#for stats
+library(rstatix)
+library(tableone)
+library(MVN)
+
+
+# set paths
+knitr::opts_knit$set(root.dir=".", aliases=c(h = "fig.height", w = "fig.width", ow = "out.width"))
+knitr::opts_chunk$set(dev = c('png'), 
+                      fig.path = here("results", "figures", "hclust_clean", ""), dpi = 300)
+theme_set(theme_light()) # global option for ggplot2
+```
+
+# Run the whole document - ONLY AT THE END OF THE WORKSTREAM
+
+```{r knit, echo=F, eval=FALSE}
+rmarkdown::render(input = here("scripts", "hclust.Rmd"), output_dir = here("results", "reports"))
+```
+
+# Load functions
+
+Here load some custom functions which support the analysis below. The scripts for these functions can be found in the `src/`-folder.
+In the utils_kadi.R file I have collated several functions to make plots, organise data in dataframes etc.
+
+```{r}
+source(here("src", "load_dada.R"))
+source(here("src", "utils_kadi.R"))
+
+```
+
+# Load files
+These are the phyloseq objects where ultrarare taxa have already been filtered out (from script called qc_decontam_08072022 - this still needs to be cleaned up to have the final version of it)
+
+```{r, message = F}
+# load phyloseq object from qc and decontam process
+phy <- readRDS(here("processed_data", "qc_decontam", "ps_final.Rds"))
+phy_RA <- readRDS(here("processed_data", "qc_decontam", "ps_final_RA.Rds"))
+
+```
+
+# Functions for visualising indices
+
+```{r hclust_functions}
+
+#to visualise all four indices
+clust_ind_fnx <- function(dist, k, method = "complete") {
+  stats_k <- c(k=k, 
+               cluster.stats(dist, cutree(hclust(dist, method=method), k))[c("ch", "avg.silwidth","within.cluster.ss","dunn")])
+  return(stats_k)
+}
+
+#to only visualise CH and average silhouette width -> present this in paper/thesis figures
+clust_ind_fnx2 <- function(dist, k, method = "complete") {
+  stats_k <- c(k=k, 
+               cluster.stats(dist, cutree(hclust(dist, method=method), k))[c("ch", "avg.silwidth")])
+  return(stats_k)
+}
+
+```
+
+# Hierarchical clustering using all samples together based on Bray-Curtis dissimilarity matrix calculated on TSS-normalised ASV table (relative abundances)
+
+First calculate the Bray-Curtis distance matrix
+
+```{r bc_allsamples_RA}
+
+# extracting data from phyloseq object to dataframes
+ASVm_all_RA <- as(otu_table(phy_RA), "matrix")
+
+# transpose
+tASVm_all_RA <- t(ASVm_all_RA)
+
+# coerce to data.frame
+ASV_all_RA <- as.data.frame(tASVm_all_RA)
+
+# calculate bray-curtis dissimilarity matrix
+bc_all_RA <- vegdist(ASV_all_RA, method = "bray")
+bc.m_all_RA <- as.matrix(bc_all_RA)
+
+bc.m_all_RA[1:5, 1:5] # visualise first 5 rows and 5 columns; please note the diagonal with 0's for comparisons between same samples.
+
+
+```
+
+Determine number of clusters to use
+
+```{r hclust_allsamples_noclusters_RA}
+
+n <- 20 #how many clusters to test
+
+#complete linkage
+clust_ind_all_RA <- lapply(2:n, clust_ind_fnx2, dist=bc_all_RA, method="complete") %>% 
+  bind_rows %>%
+  setNames(c("k", "Calinski-Harabasz", "Silhouette width"))
+
+clust_ind_all_RA %>%
+  gather(index, value, -k) %>%
+  ggplot(aes(x=k, y=value)) +
+    geom_point() +
+    geom_line() +
+    facet_wrap(vars(index), scales="free_y")
+
+
+#average linkage
+clust_ind_average_all_RA <- lapply(2:n, clust_ind_fnx2, dist=bc_all_RA, method="average") %>% 
+  bind_rows %>%
+  setNames(c("k", "Calinski-Harabasz", "Silhouette width"))
+
+avg_linkage_indices <- clust_ind_average_all_RA %>%
+  gather(index, value, -k) %>%
+  ggplot(aes(x=k, y=value)) +
+    geom_point() +
+    geom_line() +
+  ylab("Value") + xlab("Number of clusters") +
+    facet_wrap(vars(index), scales="free_y") +
+  theme_bw(base_size=13)
+
+avg_linkage_indices
+
+png(file=here("results", "figures", "cluster_indices.png"), width = 10, height = 4.5, units = "in",res=300)
+print(avg_linkage_indices)
+dev.off()
+
+```
+
+With **complete** linkage: looks like 3 or 9 clusters could be optimum, but based on Silhouette width I could have even 17/18 clusters -> not too clear how many would be good?
+With **average** linkage: based on CH and Silhouette it looks like the optimum number of clusters could be at 5 or 10 or even 11
+
+=> will continue with **average** linkage and **11 clusters** - this will give good resolution in terms of small clusters.
+
+Plot the clusters
+
+```{r hclust_all_plots_RA}
+
+# functions are at the end of the utils_kadi.R file
+
+#for average linkage and 11 clusters
+hm_plot <- cluster_plot_hm_RA(phy_RA,k=11,n_otus=20,min_size=3, method = "average")
+hm_plot
+bar_plot <- cluster_plot_bar_RA(phy_RA,k=11,n_otus=20,min_size=3, method = "average")
+bar_plot
+
+hm_plot_sampletype <- cluster_plot_hm_sampletype2_RA(phy_RA,k=11,n_otus=20,min_size=3, method = "average")
+hm_plot_sampletype
+bar_plot_sampletype <- cluster_plot_bar_sampletype2_RA(phy_RA,k=11,n_otus=20,min_size=3, method = "average")
+bar_plot_sampletype
+
+#save the plots
+png(file=here("results", "figures", "cluster_heatmap.png"), width = 10, height = 7, units = "in",res=300)
+print(hm_plot)
+dev.off()
+
+png(file=here("results", "figures", "cluster_barplot.png"), width = 10, height = 7, units = "in",res=300)
+print(bar_plot)
+dev.off()
+
+png(file=here("results", "figures", "cluster_heatmap_sampletype.png"), width = 12, height = 7, units = "in",res=300)
+print(hm_plot_sampletype)
+dev.off()
+
+png(file=here("results", "figures", "cluster_barplot_sampletype.png"), width = 12, height = 7, units = "in",res=300)
+print(bar_plot_sampletype)
+dev.off()
+
+
+```
+
+Add the cluster info to phyloseq metadata
+
+```{r hclust_all_addclusterinfo_RA}
+
+#add the average linkage cluster info to the metadata and phyloseq object
+#first create a dataframe with the hclust cluster info per subject
+hclust_df_average_all_RA <- cluster_plot_hm_RA(phy_RA,k=11,n_otus=20,min_size=3, method = "average", plot=F)
+hclust_df_average_all_RA <- hclust_df_average_all_RA %>% select(sample_id, clust) %>%
+  mutate(hclust_cluster_average_RA=ifelse(!is.na(clust), paste("C", clust, sep=""), "No cluster")) %>%
+  column_to_rownames("sample_id")
+
+# Turn the groups dataframe into `sample_data` 
+hclust_df_average_all_RA <- sample_data(hclust_df_average_all_RA)
+
+#and merge with the phyloseq object
+phy <- merge_phyloseq(phy, hclust_df_average_all_RA)
+head(sample_data(phy))
+table(sample_data(phy)$hclust_cluster_average_RA)
+
+#table for how many of the sample types are in which cluster
+table(sample_data(phy)$hclust_cluster_average_RA, sample_data(phy)$Visit_number)
+table(sample_data(phy)$hclust_cluster_average_RA, sample_data(phy)$type_timepoint)
+
+
+```
+
+Rename the clusters so that they would be in order
+
+Do a Fisher's ecact test to test whether visit number (mec vs pre-discharge) is significantly different between the clusters
+
+```{r hclust_all_renameclusters_RA}
+
+sample_data(phy)$hclust_cluster_average_RA_renamed <- case_when(
+  sample_data(phy)$hclust_cluster_average_RA=="C1" ~ "C1",
+  sample_data(phy)$hclust_cluster_average_RA=="C2" ~ "C2",
+  sample_data(phy)$hclust_cluster_average_RA=="C3" ~ "C3",
+  sample_data(phy)$hclust_cluster_average_RA=="C4" ~ "C4",
+  sample_data(phy)$hclust_cluster_average_RA=="C7" ~ "C5",
+  sample_data(phy)$hclust_cluster_average_RA=="C8" ~ "C6",
+  sample_data(phy)$hclust_cluster_average_RA=="C9" ~ "C7",
+  sample_data(phy)$hclust_cluster_average_RA=="No cluster" ~ "No cluster")
+
+table(sample_data(phy)$hclust_cluster_average_RA_renamed)
+table(sample_data(phy)$hclust_cluster_average_RA_renamed, sample_data(phy)$Visit_number)
+table(sample_data(phy)$hclust_cluster_average_RA_renamed, sample_data(phy)$type_timepoint)
+
+#do a Fisher's exact test to test whether meconium and pre-discharge samples differ significantly between the clusters
+#subset to samples that were put into clusters
+phy_clusters <- phy %>% subset_samples((!hclust_cluster_average_RA_renamed=="No cluster"))
+
+my_xtab <- table(sample_data(phy_clusters)$hclust_cluster_average_RA_renamed, sample_data(phy_clusters)$Visit_number) 
+my_xtab
+
+fisher_test(my_xtab, detailed = TRUE, simulate.p.value=T)
+fisher.test(my_xtab, simulate.p.value=T)
+row_wise_fisher_test(my_xtab, detailed = TRUE, p.adjust.method="BH")
+
+```
+
+Barplots per cluster
+
+```{r hclust_all_barplot_RA}
+
+#for the average linkage
+sample_barplot_disch_clusters_all_average_RA <- stacked.bar(phy, hc_order=F, n_otus=20) + facet_grid(~hclust_cluster_average_RA_renamed, scales = "free_x", space="free") + 
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), strip.text = element_text(size=12, color="black"), strip.background = element_rect(
+     color="black", fill="white", size=1, linetype="solid"
+     ), axis.title=element_text(size=12), axis.text=element_text(size=11), legend.title = element_text(size = 12)) 
+
+sample_barplot_disch_clusters_all_average_RA
+
+#also visualise as averaged across the six clusters
+cluster_group_barplot <- grouped_stacked_bar(phy, n_otus = 20, grouping_var = "hclust_cluster_average_RA_renamed")
+
+cluster_group_barplot
+
+png(file=here("results", "figures", "cluster_group_barplot.png"), width = 10, height = 6, units = "in",res=300)
+print(cluster_group_barplot)
+dev.off()
+
+
+```
+
+Visualise top members in clusters using boxplots -> just pretty plots, not included in thesis
+
+```{r hcluster_all_boxplot_RA}
+
+#first need to create a dataframe to make it
+#for this I will use the stacked.bar function that gives me the df if I set plot to FALSE
+
+df_hclust_all <- stacked.bar(phy, n_otus=15, hc_order=F, plot=F, by_genus=F)
+df_hclust_all$RA_percentage <- df_hclust_all$RA*100 #multiply by 100 to have in %
+
+
+#do the boxplot for average linkage
+cluster_boxplot <- ggplot(df_hclust_all, aes(x=hclust_cluster_average_RA_renamed, y=RA, fill=as.factor(OTU))) +
+  geom_point(position = position_dodge(width = 0.7), size=1.3, alpha=0.8, aes(color=as.factor(OTU))) +
+  geom_boxplot(outlier.shape = NA, alpha=0.7, position=position_dodge(0.7), width=0.7, color="black", coef = 0) + 
+  scale_fill_manual(name="ASV", values=c("grey90", rev(make_color_scheme("Paired", n=15)))) +
+  scale_colour_manual(name="ASV", values=c("grey90", rev(make_color_scheme("Paired", n=15)))) +
+  scale_y_continuous(expand = c(0, 0), labels = scales::percent) +
+  theme_bw(base_size=12) + theme(legend.text = ggtext::element_markdown()) +
+  guides(fill = guide_legend(ncol = 1, reverse = T),
+         color = guide_legend(ncol = 1, reverse = T)) +
+  xlab("Cluster") + ylab("Relative abundance (%)")
+
+cluster_boxplot
+
+
+png(file=here("results", "figures", "cluster_boxplot.png"), width = 10, height = 5, units = "in",res=300)
+print(cluster_boxplot)
+dev.off()
+
+
+```
+
+NMDS plot of the clusters
+Excluded the no cluster samples for better plotting
+
+NMDS plots for the hierarchical clustering -> do not report this in thesis
+
+```{r hclust_nmds}
+
+# plot the samples as points in a 2 dimensional space, and draw ellipses around groups of samples according to "group"
+
+#exclude the no cluster samples
+phy_clusters <- phy %>% subset_samples((!hclust_cluster_average_RA_renamed=="No cluster")) %>% prune_taxa(taxa_sums(.) > 0, .)
+
+#calculate relative abundances
+phy_clusters_RA <- phy_clusters %>% to_RA
+
+# extracting data from phyloseq object to dataframes
+ASVm_all_RA_clusters <- as(otu_table(phy_clusters_RA), "matrix")
+
+# transpose
+tASVm_all_RA_clusters <- t(ASVm_all_RA_clusters)
+
+# coerce to data.frame
+ASV_all_RA_clusters <- as.data.frame(tASVm_all_RA_clusters)
+
+# calculate bray-curtis dissimilarity matrix
+bc_all_RA_clusters <- vegdist(ASV_all_RA_clusters, method = "bray")
+bc.m_all_RA_clusters <- as.matrix(bc_all_RA_clusters)
+
+bc.m_all_RA_clusters[1:5, 1:5] # visualise first 5 rows and 5 columns; please note the diagonal with 0's for comparisons between same samples.
+
+ASV_RA_clusters <- otu_table(phy_clusters_RA)
+
+# set a random seed as a starting point for the ordination in order to obtain the same result each time you re-run the analysis
+set.seed(37)
+# run the ordination - do more components than two only
+ordBC <- metaMDS(data.frame(t(ASV_RA_clusters)), "bray", trymax=1000, k=4, trace = TRUE, autotransform = F)
+
+meta <- phy_clusters@sam_data
+
+nMDS <- left_join(meta %>% data.frame() %>%
+            mutate(sample.id=as.character(rownames(meta))), 
+          ordBC$points %>%
+            data.frame() %>%
+            rownames_to_column("sample.id") %>%
+            select(sample.id, NMDS1=MDS1, NMDS2=MDS2, NMDS3=MDS3, NMDS4=MDS4), 
+          by="sample.id")
+
+#make colours - the reordering makes the same colours as above in the heatmaps and barplots
+cols_clusters <- brewer.pal(length(levels(as.factor(nMDS$hclust_cluster_average_RA_renamed))),"BrBG")
+cols_clusters_reordered <- c("#F6E8C3", "#8C510A", "#F5F5F5", "#D8B365", "#C7EAE5", "#5AB4AC", "#01665E") 
+
+#one of the colours is pretty much white so will make this a better colour (the third one)
+cols_clusters_reordered_testing <- c("#F6E8C3", "#8C510A", "#D07D38", "#D8B365", "#C7EAE5", "#5AB4AC", "#01665E") #need to put these colours inside the function too!
+
+
+df_ellipse <- nMDS %>%
+    group_by(hclust_cluster_average_RA_renamed) %>% # change here the cluster name
+    do(vegan:::veganCovEllipse(
+      cov.wt(
+        data.frame(NMDS1=.$NMDS1, NMDS2=.$NMDS2))$cov %>% data.frame,
+      center=c(mean(.$NMDS1), mean(.$NMDS2))) %>% data.frame(check.names=F)) %>% 
+    ungroup
+
+p1 <- ggplot(data=nMDS, aes(NMDS1, NMDS2)) + 
+  geom_polygon(data=df_ellipse, aes(x=NMDS1, y=NMDS2, colour=hclust_cluster_average_RA_renamed, fill=hclust_cluster_average_RA_renamed), show.legend = F, alpha=0.5) +
+  geom_point(aes(colour = hclust_cluster_average_RA_renamed), size=2, alpha=0.8) + 
+  scale_color_manual(values=cols_clusters_reordered_testing, name="Cluster") +
+  scale_fill_manual(values=cols_clusters_reordered_testing) +
+  theme_bw(base_size=13) +
+  theme(legend.position = "bottom", aspect.ratio = 1)
+
+df_ellipse2 <- nMDS %>%
+    group_by(hclust_cluster_average_RA_renamed) %>% # change here the cluster name
+    do(vegan:::veganCovEllipse(
+      cov.wt(
+        data.frame(NMDS1=.$NMDS1, NMDS3=.$NMDS3))$cov %>% data.frame,
+      center=c(mean(.$NMDS1), mean(.$NMDS3))) %>% data.frame(check.names=F)) %>% 
+    ungroup
+
+p2 <- ggplot(data=nMDS, aes(NMDS1, NMDS3)) + 
+  geom_polygon(data=df_ellipse2, aes(x=NMDS1, y=NMDS3, colour=hclust_cluster_average_RA_renamed, fill=hclust_cluster_average_RA_renamed), show.legend = F, alpha=0.5) +
+  geom_point(aes(colour = hclust_cluster_average_RA_renamed), size=2, alpha=0.8) + 
+  scale_color_manual(values=cols_clusters_reordered_testing, name="Cluster") +
+  scale_fill_manual(values=cols_clusters_reordered_testing) +
+  theme_bw(base_size=13) +
+  theme(legend.position = "bottom", aspect.ratio = 1)
+
+df_ellipse3 <- nMDS %>%
+    group_by(hclust_cluster_average_RA_renamed) %>% # change here the cluster name
+    do(vegan:::veganCovEllipse(
+      cov.wt(
+        data.frame(NMDS2=.$NMDS2, NMDS3=.$NMDS3))$cov %>% data.frame,
+      center=c(mean(.$NMDS2), mean(.$NMDS3))) %>% data.frame(check.names=F)) %>% 
+    ungroup
+
+p3 <- ggplot(data=nMDS, aes(NMDS2, NMDS3)) + 
+  geom_polygon(data=df_ellipse3, aes(x=NMDS2, y=NMDS3, colour=hclust_cluster_average_RA_renamed, fill=hclust_cluster_average_RA_renamed), show.legend = F, alpha=0.5) +
+  geom_point(aes(colour = hclust_cluster_average_RA_renamed), size=2, alpha=0.8) + 
+  scale_color_manual(values=cols_clusters_reordered_testing, name="Cluster") +
+  scale_fill_manual(values=cols_clusters_reordered_testing) +
+  theme_bw(base_size=13) +
+  theme(legend.position = "bottom", aspect.ratio = 1)
+
+nmds_plot <- ggarrange(p1, p2, p3, nrow=1, common.legend = T, legend="bottom")
+nmds_plot
+
+png(file=here("results", "figures", "cluster_nmds_plot.png"), width = 10, height = 4, units = "in",res=300)
+print(nmds_plot)
+dev.off()
+
+
+```
+
+# Alpha diversity comparison between the clusters -> not reported in thesis
+
+First read in the metadata file that also includes the alpha diversity indices
+
+```{r read_meta}
+
+demo <- read.csv(here("processed_data", "demographics_alphadiversity_finalsamples_04102022.csv"))
+rownames(demo) <- demo$Row.names
+
+#take out the cluster info from phyloseq
+clusterinfo <- sample_data(phy) %>% data.frame() %>% select(hclust_cluster_average_RA_renamed)
+
+#merge
+demo_clusterinfo <- merge(clusterinfo, demo, by=0)
+
+
+
+```
+
+```{r alpha_clusters}
+
+#do a plot showing alpha diversity in the clusters
+
+shannon_rare_plot <- demo_clusterinfo %>%
+  ggplot(aes(x=hclust_cluster_average_RA_renamed, y=Shannon_rarefied, color=hclust_cluster_average_RA_renamed)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab("Shannon index") +
+  theme_bw(base_size=13) +
+  scale_color_manual(values=c(cols_clusters_reordered_testing, "gray"), name="Cluster") +
+  theme_bw(base_size=13) + theme(legend.position = "none") 
+
+observedlog10_rare_plot <- demo_clusterinfo %>%
+  ggplot(aes(x=hclust_cluster_average_RA_renamed, y=Observed_rarefied_log, color=hclust_cluster_average_RA_renamed)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab(expression(log[10]~"(Observed species)")) +
+  theme_bw(base_size=13) +
+  scale_color_manual(values=c(cols_clusters_reordered_testing, "gray"), name="Cluster") +
+  theme_bw(base_size=13) + theme(legend.position = "none") 
+
+joined_rare <- ggarrange(shannon_rare_plot, observedlog10_rare_plot, nrow=2)
+
+joined_rare
+
+png(file=here("results", "figures", "cluster_alphadiversity.png"), width = 10, height = 7, units = "in",res=300)
+print(joined_rare)
+dev.off()
+
+
+#run linear mixed effect models to see if alpha diversity differs between the clusters
+#first subset to those that were actually in a cluster
+demo_cluster_members <- demo_clusterinfo %>% subset(! (hclust_cluster_average_RA_renamed == "No cluster"))
+
+#model for shannon index
+fit.shannon <- lmerTest::lmer(Shannon_rarefied ~ hclust_cluster_average_RA_renamed + (1 | record_id), data = demo_cluster_members)
+
+anova(fit.shannon)
+summary(fit.shannon)
+fixef(fit.shannon)
+
+#posthoc test
+pairwise_shannon <- emmeans(fit.shannon, pairwise ~ "hclust_cluster_average_RA_renamed", adjust = "fdr", lmer.df = "satterthwaite")
+pairwise_shannon
+
+#make stars for the figure
+pairwise_shannon_pvals <- as.data.frame(pairwise_shannon$contrasts)
+pairwise_shannon_pvals$p.value
+pairwise_shannon_pvals$label <- cut(pairwise_shannon_pvals$p.value, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", NA))
+pairwise_shannon_pvals$new_contrast <- pairwise_shannon_pvals$contrast
+pairwise_shannon_pvals <- pairwise_shannon_pvals %>% separate(new_contrast, into=c("group1", "group2"), sep = " - ")
+pairwise_shannon_pvals <- pairwise_shannon_pvals %>% select(group1, group2, p.value, label)
+head(pairwise_shannon_pvals)
+
+
+#model for observed index
+fit.observed <- lmerTest::lmer(Observed_rarefied_log ~ hclust_cluster_average_RA_renamed + (1 | record_id), data = demo_cluster_members)
+
+anova(fit.observed)
+summary(fit.observed)
+fixef(fit.observed)
+
+#posthoc test
+pairwise_observed <- emmeans(fit.observed, pairwise ~ "hclust_cluster_average_RA_renamed", adjust = "fdr", lmer.df = "satterthwaite")
+pairwise_observed
+
+#make stars for the figure
+pairwise_observed_pvals <- as.data.frame(pairwise_observed$contrasts)
+pairwise_observed_pvals$p.value
+pairwise_observed_pvals$label <- cut(pairwise_observed_pvals$p.value, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", NA))
+pairwise_observed_pvals$new_contrast <- pairwise_observed_pvals$contrast
+pairwise_observed_pvals <- pairwise_observed_pvals %>% separate(new_contrast, into=c("group1", "group2"), sep = " - ")
+pairwise_observed_pvals <- pairwise_observed_pvals %>% select(group1, group2, p.value, label)
+head(pairwise_observed_pvals)
+
+#do plot to show the stats
+
+shannon_rare_plot2 <- demo_cluster_members %>%
+  ggplot(aes(x=hclust_cluster_average_RA_renamed, y=Shannon_rarefied, color=hclust_cluster_average_RA_renamed)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab("Shannon index") +
+  scale_color_manual(values=cols_clusters_reordered_testing, name="Cluster") +
+  stat_pvalue_manual(pairwise_shannon_pvals, y.position = max(demo_cluster_members$Shannon_rarefied)+0.25, step.increase = 0.1,label = "label", hide.ns = TRUE) +
+  theme_bw(base_size=13) + theme(legend.position = "none") 
+
+observedlog10_rare_plot2 <- demo_cluster_members %>%
+  ggplot(aes(x=hclust_cluster_average_RA_renamed, y=Observed_rarefied_log, color=hclust_cluster_average_RA_renamed)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab(expression(log[10]~"(Observed species)")) +
+  scale_color_manual(values=cols_clusters_reordered_testing, name="Cluster") +
+  stat_pvalue_manual(pairwise_observed_pvals, y.position = max(demo_cluster_members$Observed_rarefied_log)+0.25, step.increase = 0.1,label = "label", hide.ns = TRUE) +
+  theme_bw(base_size=13) + theme(legend.position = "none") 
+
+joined_rare2 <- ggarrange(shannon_rare_plot2, observedlog10_rare_plot2, ncol=2)
+
+joined_rare2
+
+png(file=here("results", "figures", "cluster_alphadiversity_stats.png"), width = 10, height = 5.5, units = "in",res=300)
+print(joined_rare2)
+dev.off()
+
+
+```
+
+# Write out the dataframe which includes clustering info
+
+```{r writedemoclusters}
+
+write.csv(demo_clusterinfo, here("processed_data", "demographics_clusterinfo_finalsamples_04102022.csv"), row.names=F)
+
+```
+
+# Cluster transition plots -> not reported in thesis
+
+Trying to adjust Wouter's script from here: https://gitlab.com/wsteenhu/muis_trx/-/blob/master/src/dot_flow_fnx.R
+Makes Fig5a here: https://www.nature.com/articles/s41564-021-01043-2/figures/5
+
+First try alluvial plots: https://cran.r-project.org/web/packages/ggalluvial/vignettes/ggalluvial.html
+
+```{r cluster_transition}
+
+library(ggalluvial)
+
+#first subset to those participants that have both sampletypes
+demo_clusterinfo_matching_subj <- demo_clusterinfo %>% subset(duplicated(record_id)) %>% select(record_id)
+demo_clusterinfo_matching <- demo_clusterinfo %>% subset(record_id %in% demo_clusterinfo_matching_subj$record_id)
+
+demo_clusterinfo_matching$hclust_cluster_average_RA_renamed <- as.factor(demo_clusterinfo_matching$hclust_cluster_average_RA_renamed)
+
+ggplot(demo_clusterinfo_matching,
+       aes(x = Visit_number, stratum = hclust_cluster_average_RA_renamed, alluvium = record_id,
+           fill = hclust_cluster_average_RA_renamed, label = hclust_cluster_average_RA_renamed)) +
+  scale_fill_manual(values=c("#F6E8C3", "#8C510A", "#D07D38", "#D8B365", "#C7EAE5", "#5AB4AC", "grey90"), name="Cluster") +
+  xlab("Sample type") + scale_x_discrete(labels=c("V1" = "Meconium", "V2" = "Pre-discharge")) +
+  ylab("Number of infants") +
+  geom_flow(stat = "alluvium", lode.guidance = "frontback",
+            color = "darkgray") +
+  geom_stratum() + theme_bw(base_size=14) +
+  theme(legend.position = "bottom")
+
+ggplot(demo_clusterinfo_matching,
+       aes(x = Visit_number, stratum = hclust_cluster_average_RA_renamed, alluvium = record_id,
+           fill = hclust_cluster_average_RA_renamed, label = hclust_cluster_average_RA_renamed)) +
+  scale_fill_manual(values=c("#F6E8C3", "#8C510A", "#D07D38", "#D8B365", "#C7EAE5", "#5AB4AC", "grey90"), name="Cluster") +
+  xlab("Sample type") + scale_x_discrete(labels=c("V1" = "Meconium", "V2" = "Pre-discharge")) +
+  ylab("Number of infants") +
+  geom_flow(stat = "alluvium", lode.guidance = "frontback",
+            color = "darkgray") +
+  geom_stratum() + theme_bw(base_size=14) +
+  theme(legend.position = "bottom") + facet_wrap(~extremely_preterm, labeller = as_labeller(c("0" = "Very preterm", "1" = "Extremely preterm")))
+
+ggplot(demo_clusterinfo_matching,
+       aes(x = Visit_number, stratum = hclust_cluster_average_RA_renamed, alluvium = record_id,
+           fill = hclust_cluster_average_RA_renamed, label = hclust_cluster_average_RA_renamed)) +
+  scale_fill_manual(values=c("#F6E8C3", "#8C510A", "#D07D38", "#D8B365", "#C7EAE5", "#5AB4AC", "grey90"), name="Cluster") +
+  xlab("Sample type") + scale_x_discrete(labels=c("V1" = "Meconium", "V2" = "Pre-discharge")) +
+  ylab("Number of infants") +
+  geom_flow(stat = "alluvium", lode.guidance = "frontback",
+            color = "darkgray") +
+  geom_stratum() + theme_bw(base_size=14) +
+  theme(legend.position = "bottom") + facet_wrap(~Vaginal_delivery, labeller = as_labeller(c("0" = "C-section", "1" = "Vaginal")))
+
+```

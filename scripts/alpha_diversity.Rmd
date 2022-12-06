@@ -1,0 +1,1068 @@
+---
+title: "Alpha diversity for TEBC faecal microbiome data"
+author: 
+  - "Kadi Vaher"
+  - "Took examples for Wouters scripts for the niches paper"
+date: '`r Sys.Date()`'
+output: html_document
+---
+
+```{r setup, include=F, message=F}
+
+library(tidyverse) 
+library(here) 
+library(phyloseq)
+#library(decontam)
+library(RColorBrewer)
+library(knitr)
+library(ggpubr)
+library(vegan)
+library(ggrepel)
+#library(microbiome)
+
+#for stats
+library(car)
+library(lmerTest)
+library(emmeans)
+library(MVN)
+
+#for model printing
+library(sjPlot)
+library(sjmisc)
+library(sjlabelled)
+
+# set paths
+knitr::opts_knit$set(root.dir=".", aliases=c(h = "fig.height", w = "fig.width", ow = "out.width"))
+knitr::opts_chunk$set(dev = c('png'), 
+                      fig.path = here("results", "figures", "alpha_diversity", ""), dpi = 300)
+theme_set(theme_light()) # global option for ggplot2
+```
+
+# Run the whole document - ONLY AT THE END OF THE WORKSTREAM
+
+```{r knit, echo=F, eval=FALSE}
+rmarkdown::render(input = here("scripts", "alpha_diversity.Rmd"), output_dir = here("results", "reports"))
+```
+
+# Load functions
+
+Here load some custom functions which support the analysis below. The scripts for these functions can be found in the `src/`-folder.
+The load_dada is for creating the ASV names, filtering out 'Mitochondria', 'Chloroplast', 'Archae' or 'Eukaryota'
+
+```{r}
+source(here("src", "load_dada.R"))
+source(here("src", "utils_kadi.R"))
+
+```
+
+# Load files
+Here I load both the abundance/prevalence filtered phyloseq object (after shallow filtering) as well as the non-filtered dataset (only decontam+extra contaminants removal)
+
+```{r, message = F}
+# load phyloseq object from qc and decontam process
+phy_filtered <- readRDS(here("processed_data", "qc_decontam", "ps_final.Rds"))
+phy_all <- readRDS(here("processed_data", "qc_decontam", "ps_contaminantsremoved_nonfiltered.Rds"))
+
+#check no of taxa
+ntaxa(phy_filtered)
+ntaxa(phy_all)
+
+```
+
+# Wrangle
+
+From the non-filtered dataset we have to remove the blanks as well as the samples that didn't pass QC (low read samples as well as the duplicate ones)
+
+```{r wrangle}
+
+#first subset to samples only and remove taxa that are not present in any of the samples
+phy_all_samples <- phy_all %>%
+  subset_samples(sample_type == "sample") %>%
+  prune_taxa(taxa_sums(.) > 0, .)
+
+#check number of samples and taxa
+nrow(sample_data(phy_all_samples))
+ntaxa(phy_all_samples)
+table(sample_data(phy_all_samples)$group_timepoint)
+ntaxa(phy_all)
+
+#check number of reads again
+sample_data(phy_all_samples)$sample_reads <- sample_sums(phy_all_samples)
+kable(data.frame(sample_data(phy_all_samples)) %>% group_by(type_timepoint) %>% summarise(meanreads=mean(sample_reads),
+                                                                           minreads=min(sample_reads),
+                                                                           maxreads=max(sample_reads)))
+
+#now exclude the samples with low reads and the duplicate ones
+#thus, need to subset to these samples that are present in the phy_filtered phyloseq object
+
+phy_all_samples_final <- phy_all_samples %>%
+  subset_samples(sample_id2 %in% sample_data(phy_filtered)$sample_id2)
+
+#check number of samples and taxa
+nrow(sample_data(phy_all_samples_final))
+ntaxa(phy_all_samples_final)
+table(sample_data(phy_all_samples_final)$group_timepoint)
+
+#check number of reads again
+sample_data(phy_all_samples_final)$sample_reads <- sample_sums(phy_all_samples_final)
+kable(data.frame(sample_data(phy_all_samples_final)) %>% group_by(type_timepoint) %>% summarise(meanreads=mean(sample_reads),
+                                                                           minreads=min(sample_reads),
+                                                                           maxreads=max(sample_reads)))
+
+```
+
+Here remove some metadata from the nonfiltered ASV table and save
+
+```{r wrangle2}
+
+sample_data(phy_all_samples_final) <- sample_data(phy_all_samples_final) %>% data.frame() %>%
+  select(sample_id2, record_id, Time_point, Visit_number, type_timepoint, preterm, GA_birth, postnatal_age_at_sample_d, PMA_sample_w)
+
+phy_all_samples_final_RA <- phy_all_samples_final %>% to_RA
+
+sl(ps_contaminantsremoved_nonfiltered_finalsamples, phy_all_samples_final, overwrite = T, dir_path = here("processed_data", "qc_decontam"))
+sl(ps_contaminantsremoved_nonfiltered_finalsamples_RA, phy_all_samples_final_RA, overwrite = T, dir_path = here("processed_data", "qc_decontam"))
+
+
+```
+
+# Rarefaction curves
+
+Just in case inspect the rarefaction curves
+
+```{r rarefaction_curves}
+
+# convert phyloseq to otu-table (required for rarefations)
+otu_tab_rare <- phy_all_samples_final %>% # consider only running rarefactions on samples with lower read counts
+  otu_table() %>%
+  as(., "matrix") %>% 
+  t
+
+# To generate standard plot:
+rare_curve_data_s2000 <- vegan::rarecurve(otu_tab_rare, step = 2000) # adjust step for higher/lower resolution; note this step requires some computing time
+
+# To get the data and create more custom plots:
+map2_dfr(rare_curve_data_s2000, rownames(otu_tab_rare), ~enframe(.x) %>% mutate(sample_id = .y)) %>%
+  mutate(name = str_remove(name, "N") %>% as.numeric) %>%
+  ggplot(aes(x = name, y = value, group = sample_id)) +
+  geom_line(alpha = 0.15) +
+  scale_y_log10() +
+  scale_x_continuous(labels = scales::comma, breaks=seq(0,340000,20000)) +
+  labs(x = "Sample size", y = "Number of species")
+
+
+
+```
+
+Rarefaction curves for meconium samples
+
+```{r rarefaction_curves_meconium}
+
+# To select only meconium samples
+phy_v1 <- phy_all_samples_final %>%
+  subset_samples(Visit_number == 'V1')
+
+# convert phyloseq to otu-table
+otu_tab_rare_v1 <- phy_v1 %>% # consider only running rarefactions on samples with lower read counts
+  otu_table() %>%
+  as(., "matrix") %>% 
+  t
+
+# To generate standard plot:
+rare_curve_data_s2000_v1 <- vegan::rarecurve(otu_tab_rare_v1, step = 2000) # adjust step for higher/lower resolution; note this step requires some computing time
+
+# To get the data and create more custom plots:
+map2_dfr(rare_curve_data_s2000_v1, rownames(otu_tab_rare_v1), ~enframe(.x) %>% mutate(sample_id = .y)) %>%
+  mutate(name = str_remove(name, "N") %>% as.numeric) %>%
+  ggplot(aes(x = name, y = value, group = sample_id)) +
+  geom_line(alpha = 0.15) +
+  scale_y_log10() +
+  scale_x_continuous(labels = scales::comma, breaks=seq(0,340000,20000)) +
+  labs(x = "Sample size", y = "Number of species")
+
+
+```
+
+Rarefaction curves for pre-discharge samples
+
+```{r rarefaction_curves_predisch}
+
+# To select only pre-discharge samples
+phy_v2 <- phy_all_samples_final %>%
+  subset_samples(Visit_number == 'V2')
+
+# convert phyloseq to otu-table 
+otu_tab_rare_v2 <- phy_v2 %>% # consider only running rarefactions on samples with lower read counts
+  otu_table() %>%
+  as(., "matrix") %>% 
+  t
+
+# To generate standard plot:
+rare_curve_data_s2000_v2 <- vegan::rarecurve(otu_tab_rare_v2, step = 2000) # adjust step for higher/lower resolution; note this step requires some computing time
+
+# To get the data and create more custom plots:
+map2_dfr(rare_curve_data_s2000_v2, rownames(otu_tab_rare_v2), ~enframe(.x) %>% mutate(sample_id = .y)) %>%
+  mutate(name = str_remove(name, "N") %>% as.numeric) %>%
+  ggplot(aes(x = name, y = value, group = sample_id)) +
+  geom_line(alpha = 0.15) +
+  scale_y_log10() +
+  scale_x_continuous(labels = scales::comma, breaks=seq(0,340000,20000)) +
+  labs(x = "Sample size", y = "Number of species")
+
+
+```
+
+# Rarefaction
+
+```{r rarefaction_data}
+
+phy_all_rare <- phyloseq::rarefy_even_depth(phy_all_samples_final, min(sample_sums(phy_all_samples_final)), rngseed = 149, replace = F)
+
+ntaxa(phy_all_rare)
+sample_sums(phy_all_rare) #depth is 10200 reads
+
+```
+
+# Alpha diversity (ASV-level)
+
+It is important to calculate measures of alpha diversity before removing ultrarare species to get accurate estimations, however rarefaction is still important as well as richness is influenced by the read counts/no of amplicons
+I will calculate:
+- Shannon index that combines richness and evenness
+- Observed species as a measure of microbial richness
+
+However, I will also calculate it based on non-rarefied counts in order to compare
+
+```{r alpha_calculation}
+
+alpha_div_metrics_rare <- estimate_richness(phy_all_rare, measures=c("Shannon", "Observed"))
+
+alpha_div_metrics_nonrare <- estimate_richness(phy_all_samples_final, measures=c("Shannon", "Observed"))
+
+
+```
+
+# Merge with metadata to make plots
+
+```{r merge_alpha}
+
+#first in the two datasets change the column names
+colnames(alpha_div_metrics_rare) <- paste(colnames(alpha_div_metrics_rare), "rarefied", sep = "_")
+colnames(alpha_div_metrics_nonrare) <- paste(colnames(alpha_div_metrics_nonrare), "non-rarefied", sep = "_")
+
+#now merge these two together
+all_alpha <- merge(alpha_div_metrics_rare, alpha_div_metrics_nonrare, by=0, all=T)
+rownames(all_alpha) <- all_alpha$Row.names
+all_alpha <- all_alpha %>% select(-Row.names)
+
+#now merge with metadata to make plots
+
+#first take out the metadata
+meta <- phy_all_samples_final@sam_data
+
+#add alpha diversity measures
+
+meta_alpha <- merge(meta, all_alpha, by=0, all=T)
+
+#make the Row.names column as actual rownames
+rownames(meta_alpha) <- meta_alpha$Row.names
+meta_alpha <- meta_alpha %>% select(-Row.names)
+
+```
+
+```{r alpha_correl}
+
+#check to what extent the rarefied and non-rarefied alpha diversity measures match -> very highly correlated
+
+cor.test(meta_alpha$Shannon_rarefied, meta_alpha$"Shannon_non-rarefied")
+cor.test(meta_alpha$Observed_rarefied, meta_alpha$"Observed_non-rarefied")
+
+```
+
+
+# Plot alpha diversity
+
+```{r alpha_longformat}
+
+#First make long dataframes
+
+meta_shannon_small <- meta_alpha %>% select(sample_id2,
+                                          type_timepoint, 
+                                          Shannon_rarefied, 
+                                          "Shannon_non-rarefied") %>%
+  rename(Rarefied=Shannon_rarefied, "Non-rarefied"="Shannon_non-rarefied")
+
+meta_shannon_small_long <- meta_shannon_small %>% 
+  pivot_longer(c(Rarefied, "Non-rarefied"), names_to = "Rarefaction", values_to = "Shannon_index")
+
+
+meta_observed_small <- meta_alpha %>% select(sample_id2,
+                                          type_timepoint, 
+                                          Observed_rarefied,
+                                          "Observed_non-rarefied")%>%
+  rename(Rarefied=Observed_rarefied, "Non-rarefied"="Observed_non-rarefied")
+
+meta_observed_small_long <- meta_observed_small %>% 
+  pivot_longer(c(Rarefied, "Non-rarefied"), names_to = "Rarefaction", values_to = "Observed")
+
+
+alpha_long <- merge(meta_shannon_small_long, meta_observed_small_long, by=c("sample_id2", "type_timepoint", "Rarefaction"))
+
+```
+
+```{r alpha_plots}
+
+#shannon index
+
+ggplot(alpha_long, aes(x=type_timepoint, y=Shannon_index, color=type_timepoint)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab("Shannon index") +
+  theme_bw(base_size=13) +
+  scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3"), name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-dicharge")) +
+  scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+                              "1_V2" = "Preterm pre-discharge")) +
+  theme_bw(base_size=13) + theme(legend.position = "none") +
+  facet_wrap(~Rarefaction)
+
+#Observed
+ggplot(alpha_long, aes(x=type_timepoint, y=Observed, color=type_timepoint)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab("Observed") +
+  theme_bw(base_size=13) +
+  scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3"), name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-dicharge")) +
+  scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+                              "1_V2" = "Preterm pre-discharge")) +
+  theme_bw(base_size=13) + theme(legend.position = "none") +
+  facet_wrap(~Rarefaction)
+
+
+```
+
+The plots for the alpha diversity measures using rarefied and non-rarefied ASV tables are very similar
+
+Now will plot only the rarefied and non-rarefied in one plot so that I could use them for paper/thesis
+
+```{r alpha_rarefied}
+
+shannon_rare_plot <- alpha_long %>% subset(Rarefaction=="Rarefied") %>%
+  ggplot(aes(x=type_timepoint, y=Shannon_index, color=type_timepoint)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab("Shannon index") +
+  theme_bw(base_size=13) +
+  scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3"), name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-dicharge")) +
+  scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+                              "1_V2" = "Preterm pre-discharge")) +
+  theme_bw(base_size=13) + theme(legend.position = "none") 
+
+observed_rare_plot <- alpha_long %>% subset(Rarefaction=="Rarefied") %>%
+  ggplot(aes(x=type_timepoint, y=Observed, color=type_timepoint)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab("Observed species") +
+  theme_bw(base_size=13) +
+  scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3"), name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-dicharge")) +
+  scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+                              "1_V2" = "Preterm pre-discharge")) +
+  theme_bw(base_size=13) + theme(legend.position = "none") 
+
+joined_rare <- ggarrange(shannon_rare_plot, observed_rare_plot, ncol=2)
+
+joined_rare
+
+png(file=here("results", "figures", "alphadiv_rarefied.png"), width = 10, height = 5, units = "in",res=300)
+print(joined_rare)
+dev.off()
+
+```
+
+## Stats
+Do statistics for the alpha diversity measures calculated with rarefied counts
+
+one-way anova assumptions:
+Your dependent variable should be approximately normally distributed for each category of the independent variable, however here we need to look at
+the residuals (not the observations themselves): ANOVA assumes that the normality of the errors (or residuals)
+There needs to be homogeneity of variances: The homogeneity of variance among the group can be assessed by using Levene’s test
+
+=> so first need to run the anova and then we can check the assumptions on the residuals
+
+fit a model that adjusts for the repeated measures
+
+```{r alpha_repmeasures_model}
+
+#for shannon index
+fit.shannon <- lmerTest::lmer(Shannon_rarefied ~ type_timepoint + (1 | record_id), data = meta_alpha)
+
+anova(fit.shannon)
+summary(fit.shannon)
+fixef(fit.shannon)
+
+#posthoc test
+difflsmeans(fit.shannon,
+            test.effs="type_timepoint")
+comparison_shannon = difflsmeans(fit.shannon,
+                         test.effs="type_timepoint")
+
+comparison_shannon$p.adj = p.adjust(comparison_shannon$`Pr(>|t|)`,
+                            method = "fdr")
+
+comparison_shannon
+
+#look if assumptions are met
+#normality
+plot(fit.shannon)
+shapiro.test(residuals(fit.shannon))
+
+par(mfrow = c(1, 2))
+qqnorm(ranef(fit.shannon)$record_id[, 1], 
+       main = "Random effects of participant")
+qqnorm(resid(fit.shannon), main = "Residuals")
+#normality doesn't look too bad - only a few datapoints that are skewed towards the ends of the scale
+
+
+#homoskedacity
+boxplot(residuals(fit.shannon) ~ meta_alpha$type_timepoint)
+leveneTest(residuals(fit.shannon) ~ meta_alpha$type_timepoint)
+#these plots also look quite ok actually
+
+
+#try another option for posthoc test -> gives very similar results for emmeans and difflsmeans
+pairwise_shannon <- emmeans(fit.shannon, pairwise ~ "type_timepoint", adjust = "fdr", lmer.df = "satterthwaite")
+pairwise_shannon
+
+#make new plot to show stats values
+
+#make stars for the figure
+pairwise_shannon_pvals <- as.data.frame(pairwise_shannon$contrasts)
+pairwise_shannon_pvals$p.value
+pairwise_shannon_pvals$label <- cut(pairwise_shannon_pvals$p.value, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", NA))
+pairwise_shannon_pvals$new_contrast <- pairwise_shannon_pvals$contrast
+pairwise_shannon_pvals <- pairwise_shannon_pvals %>% separate(new_contrast, into=c("group1", "group2"), sep = " - ")
+pairwise_shannon_pvals <- pairwise_shannon_pvals %>% select(group1, group2, p.value, label)
+head(pairwise_shannon_pvals)
+
+shannon_rare_plot2 <- meta_alpha %>%
+  ggplot(aes(x=type_timepoint, y=Shannon_rarefied, color=type_timepoint)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab("Shannon index") +
+  theme_bw(base_size=13) +
+  scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3"), name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-discharge")) +
+  scale_x_discrete(labels=c("0_V1" = "Term\nmeconium", "1_V1" = "Preterm\nmeconium",
+                              "1_V2" = "Preterm\npre-discharge")) +
+  stat_pvalue_manual(pairwise_shannon_pvals, y.position = max(meta_alpha$Shannon_rarefied)+0.6, step.increase = 0.1,label = "label", hide.ns = TRUE) +
+  theme_bw(base_size=13) + theme(legend.position = "none") 
+
+
+#####
+#for observed species
+
+fit.observed <- lmerTest::lmer(Observed_rarefied ~ type_timepoint + (1 | record_id), data = meta_alpha)
+
+anova(fit.observed)
+summary(fit.observed)
+fixef(fit.observed)
+
+#posthoc test
+difflsmeans(fit.observed,
+            test.effs="type_timepoint")
+comparison_observed = difflsmeans(fit.observed,
+                         test.effs="type_timepoint")
+
+comparison_observed$p.adj = p.adjust(comparison_observed$`Pr(>|t|)`,
+                            method = "fdr")
+
+comparison_observed
+
+#look if assumptions are met
+#normality
+plot(fit.observed)
+shapiro.test(residuals(fit.observed))
+
+par(mfrow = c(1, 2))
+qqnorm(ranef(fit.observed)$record_id[, 1], 
+       main = "Random effects of participant")
+qqnorm(resid(fit.observed), main = "Residuals") #the qq plot is quite skewed
+
+#homoskedacity
+boxplot(residuals(fit.observed) ~ meta_alpha$type_timepoint)
+leveneTest(residuals(fit.observed) ~ meta_alpha$type_timepoint) #also not ideal
+
+#emmeans for observed
+emmeans(fit.observed,pairwise ~ "type_timepoint", adjust = "fdr", lmer.df = "satterthwaite")
+
+
+#----
+#log transformed the observes species
+meta_alpha <- meta_alpha %>% mutate(Observed_rarefied_log = log10(Observed_rarefied))
+
+fit.observed3 <- lmerTest::lmer(Observed_rarefied_log ~ type_timepoint + (1 | record_id), data = meta_alpha)
+anova(fit.observed3)
+summary(fit.observed3)
+fixef(fit.observed3)
+
+pairwise_observed <- emmeans(fit.observed3, pairwise ~ "type_timepoint", adjust = "fdr", lmer.df = "satterthwaite")
+pairwise_observed
+
+#look if assumptions are met
+#normality
+plot(fit.observed3)
+shapiro.test(residuals(fit.observed3))
+
+par(mfrow = c(1, 2))
+qqnorm(ranef(fit.observed3)$record_id[, 1], 
+       main = "Random effects of participant")
+qqnorm(resid(fit.observed3), main = "Residuals") #still not ideal, but definitely improved
+
+#homoskedacity
+boxplot(residuals(fit.observed3) ~ meta_alpha$type_timepoint)
+leveneTest(residuals(fit.observed3) ~ meta_alpha$type_timepoint) #also not ideal, but much better
+
+
+#show histograms of the Observed species
+hist(meta_alpha$Observed_rarefied)
+hist(meta_alpha$Observed_rarefied_log)
+
+#make a new plot to show that I did stats with log10 transformed values
+
+#make stars for the figure
+pairwise_observed_pvals <- as.data.frame(pairwise_observed$contrasts)
+pairwise_observed_pvals$p.value
+pairwise_observed_pvals$label <- cut(pairwise_observed_pvals$p.value, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", NA))
+pairwise_observed_pvals$new_contrast <- pairwise_observed_pvals$contrast
+pairwise_observed_pvals <- pairwise_observed_pvals %>% separate(new_contrast, into=c("group1", "group2"), sep = " - ")
+pairwise_observed_pvals <- pairwise_observed_pvals %>% select(group1, group2, p.value, label)
+head(pairwise_observed_pvals)
+
+
+
+observed_rare_plot2 <- meta_alpha %>%
+  ggplot(aes(x=type_timepoint, y=Observed_rarefied_log, color=type_timepoint)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab(expression(log[10]~"(Observed species)")) +
+  theme_bw(base_size=13) +
+  scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3"), name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-dicharge")) +
+  scale_x_discrete(labels=c("0_V1" = "Term\nmeconium", "1_V1" = "Preterm\nmeconium",
+                              "1_V2" = "Preterm\npre-discharge")) +
+  stat_pvalue_manual(pairwise_observed_pvals, y.position = max(meta_alpha$Observed_rarefied_log)+0.6, step.increase = 0.1,label = "label", hide.ns = TRUE) +
+  theme_bw(base_size=13) + theme(legend.position = "none") 
+
+
+######################
+#make a joint plot for the alpha diversity stats
+joined_rare2 <- ggarrange(shannon_rare_plot2, observed_rare_plot2, ncol=2, labels=c("A", "B"))
+
+joined_rare2
+
+
+png(file=here("results", "figures", "alphadiv_rarefied_withMixedEffectstattest.png"), width = 8, height = 5, units = "in",res=300)
+print(joined_rare2)
+dev.off()
+
+
+
+#p-value adjustment for the main models for shannon and observed
+pvals <- c(anova(fit.shannon)$`Pr(>F)`, anova(fit.observed3)$`Pr(>F)`)
+padj <- p.adjust(pvals, method = "fdr")
+padj
+
+
+```
+
+# Statistical analysis
+To look at the effects of:
+- preterm birth (meconium) -> done above: differs in Observed species but not for Shannon index
+- gestational age at birth (both)
+- age at sample: postnatal and PMA
+- mode of delivery
+- antibiotic exposure: for total days, I calculated % of NNU stay as some infants are simply in the hospital for longer
+- breastmilk and formula exposure during NNU stay
+- sepsis
+- nec: but only a handful of babies had NEC so probably not good comparison
+- bronchopulmonary dysplasia
+
+## Need to add in all meta/clinical data
+
+```{r add_metadata}
+
+all_samples_demo <- read.csv(here("processed_data", "demographics_microbiome_samples_250_01092022.csv"), header=T)
+
+qc_demo <- read.csv(here("processed_data", "metadata_qc_decontam_23082022.csv"), header=T)
+qc_demo <- qc_demo %>% subset(sample_type=="sample") %>% select(-record_id, -Time_point, -Visit_number, -preterm, -GA_birth, -postnatal_age_at_sample_d, -PMA_sample_w, -cos_excluded_options)
+
+demo <- merge(qc_demo, all_samples_demo, by="sample_id", all.x=T)
+
+rownames(demo) <- demo$sample_work_nr
+demo <- demo %>% select(-record_id, -Time_point, -Visit_number, -preterm, -GA_birth, -postnatal_age_at_sample_d, -PMA_sample_w)
+
+meta_alpha_demo <- merge(meta_alpha, demo, by=0, all.x=T)
+
+#save this metadata file with alpha diversity indices
+write.csv(meta_alpha_demo, file=here("processed_data", "demographics_alphadiversity_finalsamples_04102022.csv"), row.names=F)
+
+```
+
+## Meconium samples (only preterms)
+
+Test for these variables:   c("extremely_preterm", "postnatal_age_at_sample_d", "PMA_sample_w", "sex, "Vaginal_delivery",
+                             "labour_antibiotics", "AB_before72h", 
+                             "birthweight_g", "birthweight_z_score", "sepsis_binary", "nec_binary",
+                             "bronchopulmonary_dysplasia")
+
+```{r stats_mec}
+
+meta_alpha_mec <- meta_alpha_demo %>% subset(preterm==1 & Visit_number == "V1")
+nrow(meta_alpha_mec)
+
+#test for normal distribution of the variables
+cont_var_mec <- meta_alpha_mec %>% select(Shannon_rarefied, Observed_rarefied_log, GA_birth, postnatal_age_at_sample_d, PMA_sample_w, 
+                             birthweight_g, birthweight_z_score)
+
+mvn(data = cont_var_mec, univariateTest = "SW", univariatePlot = "histogram")
+
+#normally distributed are GA_birth, postnatal_age_at_sample_d, PMA_sample_w
+#however as the alpha-diversity metrics are not normally distributed, I will apply non-parametric tests here
+
+#----------------------
+#do all wilcoxon tests for the alpha diversity indices and categorical variables and write them into a table
+cat_var_mec <- c("extremely_preterm", "sex", "Vaginal_delivery",
+                             "labour_antibiotics", "AB_before72h")
+
+#make empty dataframe where to write results
+results_mec_cat <- data.frame(matrix(ncol = 4, nrow = 0))
+x <- c("alpha_div_index", "variable_name", "statistic", "pvalue")
+colnames(results_mec_cat) <- x
+
+indices <- c("Shannon_rarefied", "Observed_rarefied_log")
+
+
+for (index in 1:length(indices)){
+  alpha <- indices[index]
+  #print(alpha)
+  
+  for (var in 1:length(cat_var_mec)){
+    variable <- cat_var_mec[var]
+    #print(variable)
+    formula <- as.formula(paste(alpha, variable, sep="~"))
+    #print(formula)
+    
+    model <- wilcox.test(formula, data=meta_alpha_mec)
+    
+    tmp <-data.frame(matrix(ncol = 4, nrow = 1))
+    y <- c("alpha_div_index", "variable_name", "statistic", "pvalue")
+    colnames(tmp) <- y
+  
+    tmp$alpha_div_index <- alpha
+    tmp$variable_name <- variable
+    tmp$statistic <- model$statistic[1]
+    tmp$pvalue <- model$p.value
+    
+    #print(tmp)
+    results_mec_cat <- rbind(results_mec_cat, tmp)
+  }
+}
+
+#do all spearman collerations for the alpha diversity indices and continuous variables and write them into a table
+
+cont_var_mec_names <- c("postnatal_age_at_sample_d", "PMA_sample_w", 
+                             "birthweight_g", "birthweight_z_score")
+
+#make empty dataframe where to write results
+results_mec_cont <- data.frame(matrix(ncol = 4, nrow = 0))
+x <- c("alpha_div_index", "variable_name", "statistic", "pvalue")
+colnames(results_mec_cont) <- x
+
+for (index in 1:length(indices)){
+  alpha <- indices[index]
+  #print(alpha)
+  
+  for (var in 1:length(cont_var_mec_names)){
+    variable <- cont_var_mec_names[var]
+    #print(variable)
+    formula <- as.formula(paste("~ ", alpha, " + ", variable, sep=""))
+    #print(formula)
+    
+    model <- cor.test(formula, data=meta_alpha_mec, method="spearman")
+    
+    tmp <-data.frame(matrix(ncol = 4, nrow = 1))
+    y <- c("alpha_div_index", "variable_name", "statistic", "pvalue")
+    colnames(tmp) <- y
+  
+    tmp$alpha_div_index <- alpha
+    tmp$variable_name <- variable
+    tmp$statistic <- model$estimate[1]
+    tmp$pvalue <- model$p.value
+    
+    #print(tmp)
+    results_mec_cont <- rbind(results_mec_cont, tmp)
+  }
+}
+
+#bind all the results together, add statistic names and do p-value adjustment
+results_mec_cat <- results_mec_cat %>% mutate(statistic_value = paste("W = ", round(statistic, 3), sep=""))
+results_mec_cont <- results_mec_cont %>% mutate(statistic_value = paste("rho = ", round(statistic, 3), sep=""))
+results_mec_alpha <- rbind(results_mec_cat, results_mec_cont)
+results_mec_alpha <- results_mec_alpha %>% mutate(adj_pvalue = p.adjust(results_mec_alpha$pvalue, method="BH"))
+
+
+kable(results_mec_alpha)
+
+write.csv(results_mec_alpha, file=here("results", "tables", "results_mec_alpha.csv"), row.names=F)
+
+
+#--------------------------
+
+#correlation between the age variables
+cor.test(meta_alpha_mec$GA_birth, meta_alpha_mec$postnatal_age_at_sample_d)
+cor.test(meta_alpha_mec$GA_birth, meta_alpha_mec$PMA_sample_w)
+cor.test(meta_alpha_mec$postnatal_age_at_sample_d, meta_alpha_mec$PMA_sample_w)
+
+```
+
+## Pre-discharge samples
+
+variables_preterm_disch <-  c("extremely_preterm", "postnatal_age_at_sample_d", "PMA_sample_w", "sex, "Vaginal_delivery",
+                             "labour_antibiotics", "AB_before72h", "AB_after72h", "prop_abx_totaldays"
+                             "birthweight_g", "birthweight_z_score", "sepsis_binary", "nec_binary",
+                             "bronchopulmonary_dysplasia", "BM_75")
+
+```{r stats_predisch}
+
+meta_alpha_disch <- meta_alpha_demo %>% subset(preterm==1 & Visit_number == "V2")
+nrow(meta_alpha_disch)
+
+cont_var_disch <- meta_alpha_disch %>% select(Shannon_rarefied, Observed_rarefied_log, GA_birth, postnatal_age_at_sample_d, PMA_sample_w, prop_abx_totaldays,
+                             birthweight_g, birthweight_z_score)
+
+mvn(data = cont_var_disch, univariateTest = "SW", univariatePlot = "histogram")
+
+
+#normally distributed are Shannon index and birthweight_g -> analyses with Shannon index can be with parametric tests
+#the Observed is actually also borderline so can also use parametric tests
+
+
+#----------------------
+#do all t-tests for the alpha diversity indices and categorical variables and write them into a table
+
+cat_var_disch <- c("extremely_preterm", "sex", "Vaginal_delivery", "labour_antibiotics", "AB_before72h", "AB_after72h", "sepsis_binary", "nec_binary",
+                             "bronchopulmonary_dysplasia", "BM_75")
+
+#make empty dataframe where to write results
+results_disch_cat <- data.frame(matrix(ncol = 4, nrow = 0))
+x <- c("alpha_div_index", "variable_name", "statistic", "pvalue")
+colnames(results_disch_cat) <- x
+
+indices <- c("Shannon_rarefied", "Observed_rarefied_log")
+
+
+for (index in 1:length(indices)){
+  alpha <- indices[index]
+  #print(alpha)
+  
+  for (var in 1:length(cat_var_disch)){
+    variable <- cat_var_disch[var]
+    #print(variable)
+    formula <- as.formula(paste(alpha, variable, sep="~"))
+    #print(formula)
+    
+    model <- t.test(formula, data=meta_alpha_disch)
+    
+    tmp <-data.frame(matrix(ncol = 4, nrow = 1))
+    y <- c("alpha_div_index", "variable_name", "statistic", "pvalue")
+    colnames(tmp) <- y
+  
+    tmp$alpha_div_index <- alpha
+    tmp$variable_name <- variable
+    tmp$statistic <- model$statistic[1]
+    tmp$pvalue <- model$p.value
+    
+    #print(tmp)
+    results_disch_cat <- rbind(results_disch_cat, tmp)
+  }
+}
+
+#do all spearman collerations for the alpha diversity indices and continuous variables and write them into a table
+#for birthweight I could do pearson correlation as it is normally distributed, however, I will do spearman to have the same test for all
+
+cont_var_disch_names <- c("postnatal_age_at_sample_d", "PMA_sample_w", "prop_abx_totaldays",
+                             "birthweight_g", "birthweight_z_score")
+
+#make empty dataframe where to write results
+results_disch_cont <- data.frame(matrix(ncol = 4, nrow = 0))
+x <- c("alpha_div_index", "variable_name", "statistic", "pvalue")
+colnames(results_disch_cont) <- x
+
+for (index in 1:length(indices)){
+  alpha <- indices[index]
+ # print(alpha)
+  
+  for (var in 1:length(cont_var_disch_names)){
+    variable <- cont_var_disch_names[var]
+   # print(variable)
+    formula <- as.formula(paste("~ ", alpha, " + ", variable, sep=""))
+   # print(formula)
+    
+    model <- cor.test(formula, data=meta_alpha_disch, method="spearman")
+    
+    tmp <-data.frame(matrix(ncol = 4, nrow = 1))
+    y <- c("alpha_div_index", "variable_name", "statistic", "pvalue")
+    colnames(tmp) <- y
+  
+    tmp$alpha_div_index <- alpha
+    tmp$variable_name <- variable
+    tmp$statistic <- model$estimate[1]
+    tmp$pvalue <- model$p.value
+    
+    #print(tmp)
+    results_disch_cont <- rbind(results_disch_cont, tmp)
+  }
+}
+
+#bind all the results together, add statistic names and do p-value adjustment
+results_disch_cat <- results_disch_cat %>% mutate(statistic_value = paste("t = ", round(statistic, 3), sep=""))
+results_disch_cont <- results_disch_cont %>% mutate(statistic_value = paste("rho = ", round(statistic, 3), sep=""))
+results_disch_alpha <- rbind(results_disch_cat, results_disch_cont)
+results_disch_alpha <- results_disch_alpha %>% mutate(adj_pvalue = p.adjust(results_disch_alpha$pvalue, method="BH"))
+
+
+kable(results_disch_alpha)
+
+write.csv(results_disch_alpha, file=here("results", "tables", "results_disch_alpha.csv"), row.names=F)
+
+
+#correlation between the age variables
+cor.test(meta_alpha_disch$GA_birth, meta_alpha_disch$postnatal_age_at_sample_d)
+cor.test(meta_alpha_disch$GA_birth, meta_alpha_disch$PMA_sample_w)
+cor.test(meta_alpha_disch$postnatal_age_at_sample_d, meta_alpha_disch$PMA_sample_w)
+#strong positive correlations so not sure whether I can adjust for postnatal age at sample when looking at the effects of GA at birth -> multicollinearity issues
+
+
+#also do a full model for observed species (different options here)
+
+fit_disch_observed <- lm(formula = scale(Observed_rarefied_log) ~ nec_binary + scale(GA_birth) + scale(PMA_sample_w) + scale(birthweight_z_score), data=meta_alpha_disch)
+par(mfrow=c(2,2))
+plot(fit_disch_observed)
+par(mfrow=c(1,1))
+qqPlot(fit_disch_observed$residuals)
+hist(fit_disch_observed$residuals)
+summary(fit_disch_observed)
+
+fit_disch_observed2 <- lm(formula = scale(Observed_rarefied_log) ~ scale(GA_birth) + scale(PMA_sample_w) + scale(birthweight_z_score), data=meta_alpha_disch)
+par(mfrow=c(2,2))
+plot(fit_disch_observed2)
+par(mfrow=c(1,1))
+qqPlot(fit_disch_observed2$residuals)
+hist(fit_disch_observed2$residuals)
+summary(fit_disch_observed2)
+
+
+fit_disch_observed3 <- lm(formula = scale(Observed_rarefied_log) ~ extremely_preterm + scale(PMA_sample_w) + scale(birthweight_z_score), data=meta_alpha_disch)
+par(mfrow=c(2,2))
+plot(fit_disch_observed3)
+par(mfrow=c(1,1))
+qqPlot(fit_disch_observed3$residuals)
+hist(fit_disch_observed3$residuals)
+summary(fit_disch_observed3)
+
+fit_disch_observed4 <- lm(formula = scale(Observed_rarefied_log) ~ extremely_preterm + scale(PMA_sample_w) + scale(birthweight_z_score) + nec_binary, data=meta_alpha_disch)
+par(mfrow=c(2,2))
+plot(fit_disch_observed4)
+par(mfrow=c(1,1))
+qqPlot(fit_disch_observed4$residuals)
+hist(fit_disch_observed4$residuals)
+summary(fit_disch_observed4)
+
+
+#exclude NEC babies -> this is the final model I am reporting!!!
+
+meta_alpha_disch_nonec <- meta_alpha_disch %>% subset(nec_binary==0)
+
+fit_disch_observed6 <- lm(formula = scale(Observed_rarefied_log) ~ extremely_preterm + scale(birthweight_z_score) + scale(PMA_sample_w), data=meta_alpha_disch_nonec)
+par(mfrow=c(2,2))
+plot(fit_disch_observed6)
+par(mfrow=c(1,1))
+qqPlot(fit_disch_observed6$residuals)
+hist(fit_disch_observed6$residuals)
+summary(fit_disch_observed6)
+
+tab_model(fit_disch_observed6, show.intercept = F, show.se = T, file=here("results", "tables", "disch_observed_multivariable.html"), digits=3)
+
+
+summary(lm(formula = scale(Observed_rarefied_log) ~ extremely_preterm, data=meta_alpha_disch))
+
+```
+
+Investigate the effects of some variables
+
+```{r investigation_variables}
+
+meta_alpha_disch %>%
+  ggplot(aes(x=as.factor(nec_binary), y=Observed_rarefied_log, color=as.factor(nec_binary))) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab(expression(log[10]~"(Observed species)")) +
+  theme_bw(base_size=13) +
+  #scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3"), name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-dicharge")) +
+  #scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+  #                            "1_V2" = "Preterm pre-discharge")) +
+  theme(legend.position = "right") 
+
+table(meta_alpha_disch$nec_binary) #only three infants so probably not a very good comparison
+
+meta_alpha_disch %>%
+  ggplot(aes(x=as.factor(AB_before72h), y=Observed_rarefied_log, color=as.factor(AB_before72h))) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab(expression(log[10]~"(Observed species)")) +
+  theme_bw(base_size=13) +
+  #scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3"), name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-dicharge")) +
+  #scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+  #                            "1_V2" = "Preterm pre-discharge")) +
+  theme(legend.position = "right") 
+
+meta_alpha_disch %>%
+  ggplot(aes(x=as.factor(AB_after72h), y=Observed_rarefied_log, color=as.factor(AB_after72h))) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab(expression(log[10]~"(Observed species)")) +
+  theme_bw(base_size=13) +
+  #scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3"), name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-dicharge")) +
+  #scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+  #                            "1_V2" = "Preterm pre-discharge")) +
+  theme(legend.position = "right") 
+
+meta_alpha_disch %>%
+  ggplot(aes(x=as.factor(sepsis_binary), y=Observed_rarefied_log, color=as.factor(sepsis_binary))) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab(expression(log[10]~"(Observed species)")) +
+  theme_bw(base_size=13) +
+  #scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3"), name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-dicharge")) +
+  #scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+  #                            "1_V2" = "Preterm pre-discharge")) +
+  theme(legend.position = "right") 
+
+meta_alpha_disch %>%
+  ggplot(aes(x=as.factor(bronchopulmonary_dysplasia), y=Observed_rarefied_log, color=as.factor(bronchopulmonary_dysplasia))) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab(expression(log[10]~"(Observed species)")) +
+  theme_bw(base_size=13) +
+  #scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3"), name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-dicharge")) +
+  #scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+  #                            "1_V2" = "Preterm pre-discharge")) +
+  theme(legend.position = "right") 
+
+meta_alpha_disch %>%
+  ggplot(aes(x=as.factor(extremely_preterm), y=Observed_rarefied_log, color=as.factor(extremely_preterm))) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab(expression(log[10]~"(Observed species)")) +
+  theme_bw(base_size=13) +
+  #scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3"), name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-dicharge")) +
+  #scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+  #                            "1_V2" = "Preterm pre-discharge")) +
+  theme(legend.position = "right") 
+
+meta_alpha_disch %>%
+  ggplot(aes(x=as.factor(extremely_preterm), y=Shannon_rarefied, color=as.factor(extremely_preterm))) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab("Shannon index") +
+  theme_bw(base_size=13) +
+  #scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3"), name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-dicharge")) +
+  #scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+  #                            "1_V2" = "Preterm pre-discharge")) +
+  theme(legend.position = "right") 
+
+meta_alpha_disch %>%
+  ggplot(aes(x=as.factor(sex), y=Observed_rarefied_log, color=as.factor(sex))) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab(expression(log[10]~"(Observed species)")) +
+  theme_bw(base_size=13) +
+  #scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3"), name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-dicharge")) +
+  #scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+  #                            "1_V2" = "Preterm pre-discharge")) +
+  theme(legend.position = "right") 
+
+meta_alpha_disch %>%
+  ggplot(aes(x=as.factor(sex), y=Shannon_rarefied, color=as.factor(sex))) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(width = 0.2, size=2.5, alpha=0.6) +
+  xlab("") +
+  ylab(expression(log[10]~"(Observed species)")) +
+  theme_bw(base_size=13) +
+  #scale_color_manual(values=c("#1B9E77", "#FDC46B", "#7570B3"), name="Type", labels=c("Term meconium", "Preterm meconium", "Preterm pre-dicharge")) +
+  #scale_x_discrete(labels=c("0_V1" = "Term meconium", "1_V1" = "Preterm meconium",
+  #                            "1_V2" = "Preterm pre-discharge")) +
+  theme(legend.position = "right") 
+
+
+
+```
+
+Interesting that abx exposed and sepsis babies have higher observed species rather than lower.
+also same with BPD and extremely preterm birth
+
+# Test for clinical characteristic differences between males and females
+
+```{r male_female_clinical}
+
+#do demographic table in male vs female
+shapiro.test(meta_alpha_disch$PMA_sample_w)
+shapiro.test(meta_alpha_disch$postnatal_age_at_sample_d)
+
+library(tableone)
+allVars <- c("GA_birth", "postnatal_age_at_sample_d", "PMA_sample_w",
+             "birthweight_g", "birthweight_z_score", 
+             "Vaginal_delivery", 
+             "antenatal_steroids_given", "mgso_any", 
+             "labour_antibiotics", "membr_rupt_durations_hours",
+             "days_nnu",  
+             "bronchopulmonary_dysplasia", "nec_binary",
+             "sepsis_binary", "retinopathy_or_premat", 
+             "AB_before72h", "AB_after72h", "totaldays", "prop_abx_totaldays",
+             "GA_discharge", "BM_75", "feeding_at_discharge",
+             "maternal_age", "bmi_at_booking",
+             "SIMD_perinatal",
+             "maternal_final_education", "paternal_final_education")
+
+catVars <- c("Vaginal_delivery","BM_75",
+             "antenatal_steroids_given", "mgso_any", "labour_antibiotics",
+             "bronchopulmonary_dysplasia", "nec_binary", "AB_before72h", "AB_after72h",
+             "sepsis_binary", "retinopathy_or_premat",
+             "feeding_at_discharge",
+             "SIMD_perinatal",
+             "maternal_final_education", "paternal_final_education")
+
+nnvars <- c("GA_birth", "postnatal_age_at_sample_d", "PMA_sample_w", "birthweight_z_score", "membr_rupt_durations_hours", "days_nnu",
+                               "totaldays", "prop_abx_totaldays", "GA_discharge", "prop_days_excl_any_breastmilk", "prop_days_excl_formula", "prop_days_mixed_feed",
+                               "bmi_at_booking")
+
+
+#table for all subjects who had samples collected
+descr_table <- CreateTableOne(vars=allVars, strata="sex", data=meta_alpha_disch, factorVars = catVars, includeNA = T, addOverall = T)
+matrix_descr_table <- print(descr_table, showAllLevels = T, nonnormal = nnvars, minMax = T, explain=T, exact = catVars, contDigits = 3, printToggle = F, noSpaces = T)
+
+write.csv(matrix_descr_table, file=here("results", "tables", "descriptive_stats_discharge_male_female.csv"))
+
+```
+
+Only differences in males and females are in birthweight and birthweigt z-score, which are both higher in males

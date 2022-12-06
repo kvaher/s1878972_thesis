@@ -1,0 +1,300 @@
+---
+title: "`r subdir_name`"
+author: "Kadi Vaher"
+date: "`r Sys.time()`"
+output: html_document
+---
+
+```{r setup, include=T, message=F}
+subdir_name <- "microbiota_mri_demo"
+
+# load packages
+library(tidyverse)
+library(here)
+library(magrittr)
+library(glue)
+library(ggpubr)
+library(knitr)
+library(readxl)
+library(MVN)
+library(tableone)
+
+# set paths
+knitr::opts_knit$set(root.dir = ".", aliases = c(h = "fig.height", w = "fig.width", ow = "out.width"))
+knitr::opts_chunk$set(
+  dev = c("png"),
+  fig.path = here("results", "figures", glue("{subdir_name}/")), dpi = 300
+)
+theme_set(theme_light()) # global option for ggplot2
+```
+
+```{r knit, echo=F, eval=FALSE}
+rmarkdown::render(
+  input = here("scripts", str_c(subdir_name, ".Rmd")),
+  output_file = here("results", "reports", paste(subdir_name, ".html", sep="_"))
+)
+```
+
+# Read in data
+
+Subject list (those with pre-discharge samples)
+
+```{r subj_list}
+
+subj_list <- read.csv(here("processed_data", "disch_sample_subjects.csv"))
+
+```
+
+MRI-specific demographics (including parts of the MRI report)
+
+
+```{r mri_demo}
+
+mridemo <- read.csv(here("raw_data", "redcap_extractions", "EdinburghBirthCohort-KadiMRIdemo_DATA_2022-09-02_1428.csv"))
+
+```
+
+Tables with MRI data in order to find the max sample size that have any kind of imaging
+
+```{r mri_data}
+
+str_data <- read.csv(here("imaging_data", "raw_data", "Morphology-MASTER.csv"))
+diff_gm <- read_excel(here("imaging_data", "raw_data", "dMRI_metrics_TEBC.xlsx"), sheet = 1)
+tracts <- read.csv(here("imaging_data", "processed_data", "weighted_tracts", "FA_tracts.csv"))
+
+
+```
+
+# Wrangle data
+
+subset the imaging datafiles to those subjects I can use (have pre-discharge samples)
+
+```{r wrangle}
+
+#first remove one subject from the gm diffusion file
+diff_gm <- diff_gm %>% subset(!record_id=="8382")
+
+
+str_data <- str_data %>% rename(record_id=subject.ID) %>%
+  subset(record_id %in% subj_list$record_id)
+diff_gm <- diff_gm %>% subset(record_id %in% subj_list$record_id)
+tracts <- tracts %>% subset(record_id %in% subj_list$record_id)
+
+
+#which babies are in tracts list but not in structural data -> need to check whether these three participants need to be excluded due to biological reasons that lead to technical difficulties (e.g. large ventricles)
+tracts$record_id[which(! (tracts$record_id %in% str_data$record_id))]
+
+
+#which babies are in structural list but not in tracts data -> for these we don't have diffusion data or the processing failed
+str_data$record_id[which(! (str_data$record_id %in% tracts$record_id))]
+
+#which babies are in structural list but not in gm diffusion data -> for these we don't have diffusion data or the processing failed
+str_data$record_id[which(! (str_data$record_id %in% diff_gm$record_id))]
+
+#which babies in tracts data but not in gm diffusion
+tracts$record_id[which(! (tracts$record_id %in% diff_gm$record_id))]
+
+#make a list with subjects that have any imaging data
+
+all_imaging_subj <- c(str_data$record_id, tracts$record_id, diff_gm$record_id)
+all_imaging_subj <- unique(all_imaging_subj)
+
+
+#subset the demographics table to this list
+demo <- mridemo %>% subset(record_id %in% all_imaging_subj)
+
+
+```
+
+# Look at the MRI reports
+
+```{r mri_reports}
+
+#periventricular loss score=3
+demo$record_id[which(demo$mri_wm_perivent_loss==3)]
+#periventricular loss score=2
+demo$record_id[which(demo$mri_wm_perivent_loss==2)]
+
+#cyst score=3
+demo$record_id[which(demo$mri_wm_cystic_abnormality==3)]
+#cyst score=2
+demo$record_id[which(demo$mri_wm_cystic_abnormality==2)]
+
+#ventricular dilatation score=3
+demo$record_id[which(demo$mri_wm_ventric_dilatation==3)]
+#ventricular dilatation score=2
+demo$record_id[which(demo$mri_wm_ventric_dilatation==2)]
+
+
+```
+Notes about subjects to exclude
+- 8342 and 8250 -> structural processing didn't work. registration done via FA so if have diffusion then have tracts (don't need structural)
+- 8319: very big ventricles -> has diffusion, structural processing fails because of the large ventricles -> can keep it as the tracts we checked look fine!! 
+- 8380: has both structural and the tracts -> exclude this baby too; probably a very specific injury.
+- 8345: very large ventricles; have all the data there. -> can include; tracts look similar to 8319
+- Parenchemal findings that mean exclusion: 8160, 8405, 8428 -> I only have 8405 to consider
+
+# Final list of subjects
+
+```{r final_list}
+
+nrow(demo)
+
+demo <- demo %>% subset(! record_id %in% c(8380, 8405, 8160, 8428))
+
+nrow(demo)
+
+mri_mb_subjects <- demo$record_id
+
+#infants with structural data
+str_data <- str_data %>% subset(record_id %in% mri_mb_subjects)
+nrow(str_data)
+
+#infants with diffusion data in regions (GM and WM labels)
+diff_gm <- diff_gm %>% subset(record_id %in% mri_mb_subjects)
+nrow(diff_gm)
+
+#infants with tracts data
+tracts <- tracts %>% subset(record_id %in% mri_mb_subjects)
+nrow(tracts)
+
+```
+# Demographics/clinical data file
+
+Now make a demographics file for all infants I will include in the microbiota-brain project
+
+```{r read_demo}
+
+demodata <- read.csv(here("processed_data", "demographics_microbiome_subjects_206_01092022.csv"))
+
+all_samples_demo <- read.csv(here("processed_data", "demographics_microbiome_samples_250_01092022.csv"), header=T)
+
+#subset to only have the pre-discharge samples
+all_disch <- all_samples_demo %>% subset(Visit_number=="V2")
+
+
+#read the QC data
+qcdata <- read.csv(here("processed_data", "metadata_qc_decontam_23082022.csv"))
+ids <- qcdata %>% select(sample_id, sample_work_nr)
+
+all_disch <- merge(ids, all_disch, by="sample_id", all.y=T)
+
+```
+
+## Wrangle 
+Remove some columns from the MRI demo that are already present in the big demographics file and merge
+
+```{r demo_wrangle}
+
+demo <- demo %>% select(record_id, mri_wm_perivent_loss, mri_wm_cystic_abnormality, 
+                        mri_wm_ventric_dilatation, date_of_mri )
+
+demo <- merge(all_disch, demo, by="record_id", all.y=T)
+
+#remove duplicate samples
+demo <- demo %>% subset(! (sample_id %in% c("TW_03_8447_V1_s2", "TW_03_8034_V2_s1", "TW_03_8049_V2_s1", "TW_03_8070_V2_s2")))
+
+#correct the GA at mri column
+
+demo <- demo %>% mutate(GA_mri=cga_mri+cga_mri_plus/7)
+
+#calculate time between sample collection and MRI
+
+demo <- demo %>% mutate(diff_predisch_mri_w = GA_mri-PMA_sample_w)
+
+mean(demo$diff_predisch_mri_w)
+
+#recode the maternal education column and also the paternal
+
+demo <- demo %>% mutate(
+  maternal_edu_recoded=case_when(maternal_final_education == 1 ~ "None",
+                                 maternal_final_education == 2 ~ "None",
+                                 maternal_final_education == 3 ~ "None",
+                                 maternal_final_education == 4 ~ "High_school",
+                                 maternal_final_education == 5 ~ "College/University",
+                                 maternal_final_education == 6 ~ "College/University",
+                                 maternal_final_education == 7 ~ "College/University"))
+
+demo <- demo %>% mutate(
+  paternal_edu_recoded=case_when(paternal_final_education == 1 ~ "None",
+                                 paternal_final_education == 2 ~ "None",
+                                 paternal_final_education == 3 ~ "None",
+                                 paternal_final_education == 4 ~ "High_school",
+                                 paternal_final_education == 5 ~ "College/University",
+                                 paternal_final_education == 6 ~ "College/University",
+                                 paternal_final_education == 7 ~ "College/University"))
+
+
+#write into a file
+#write.csv(demo, here("processed_data", "demographics_microbiome_mri_79_10102022.csv"), row.names=F)
+
+
+```
+
+# Demographics table
+
+### Checking normality of the variables
+
+```{r normality}
+
+numvars <- demo %>% select(GA_birth, birthweight_g, birthweight_z_score, membr_rupt_durations_hours, days_nnu,
+                               totaldays, prop_abx_totaldays, GA_discharge, prop_days_excl_any_breastmilk, prop_days_excl_formula, prop_days_mixed_feed,
+                               maternal_age, bmi_at_booking, 
+                           GA_mri, mri_weight, mri_weight_z_score, diff_predisch_mri_w,
+                           postnatal_age_at_sample_d, PMA_sample_w)
+
+
+mvn(data = numvars, univariateTest = "SW", univariatePlot = "qqplot")
+mvn(data = numvars, univariateTest = "SW", univariatePlot = "histogram")
+
+```
+
+Normally distributed in full dataset: birthweight_g, maternal_age, GA_mri, mri_weight_z_score, diff_predisch_mri_w
+
+## Make the descriptive table
+
+``` {r demotable}
+
+allVars <- c("GA_birth", 
+             "sex", 
+             "birthweight_g", "birthweight_z_score", 
+             "GA_mri", "mri_weight", "mri_weight_z_score",
+             "postnatal_age_at_sample_d", "PMA_sample_w",
+             "diff_predisch_mri_w",
+             "Vaginal_delivery", 
+             "antenatal_steroids_given", "mgso_any", 
+             "labour_antibiotics", "membr_rupt_durations_hours",
+             "days_nnu",  
+             "bronchopulmonary_dysplasia", "nec_binary",
+             "sepsis_binary", "retinopathy_or_premat", 
+             "AB_before72h", "AB_after72h", "totaldays", "prop_abx_totaldays",
+             "GA_discharge", 
+             "prop_days_excl_any_breastmilk", "prop_days_excl_formula", "prop_days_mixed_feed", "feeding_at_discharge",
+             "mri_current_feeding",
+             "maternal_age", "bmi_at_booking",
+             "SIMD_perinatal",
+             "maternal_final_education", "paternal_final_education",
+             "maternal_edu_recoded", "paternal_edu_recoded")
+
+catVars <- c("sex", 
+             "Vaginal_delivery",
+             "antenatal_steroids_given", "mgso_any", "labour_antibiotics",
+             "bronchopulmonary_dysplasia", "nec_binary", "AB_before72h", "AB_after72h",
+             "sepsis_binary", "retinopathy_or_premat",
+             "feeding_at_discharge","mri_current_feeding",
+             "SIMD_perinatal",
+             "maternal_final_education", "paternal_final_education",
+             "maternal_edu_recoded", "paternal_edu_recoded")
+
+nnvars <- c("GA_birth", "birthweight_z_score", "membr_rupt_durations_hours", "days_nnu",
+                               "totaldays", "prop_abx_totaldays", "GA_discharge", "prop_days_excl_any_breastmilk", "prop_days_excl_formula", "prop_days_mixed_feed",
+                               "bmi_at_booking", "mri_weight", "postnatal_age_at_sample_d", "PMA_sample_w")
+
+
+#table for all subjects who had samples collected
+descr_table <- CreateTableOne(vars=allVars, data=demo, factorVars = catVars, includeNA = T, addOverall = T)
+matrix_descr_table <- print(descr_table, showAllLevels = T, nonnormal = nnvars, minMax = T, explain=T, exact = catVars, contDigits = 3, printToggle = F, noSpaces = T)
+
+write.csv(matrix_descr_table, file=here("results", "tables", "descriptive_stats_microb_match_mri_79.csv"))
+
+```

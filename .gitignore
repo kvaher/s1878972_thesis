@@ -1,0 +1,9 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+imaging_data/
+processed_data/
+raw_data/
+results/
+directory_structure.txt

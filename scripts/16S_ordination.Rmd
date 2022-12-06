@@ -1,0 +1,245 @@
+---
+title: "TEBC pre-discharge faecal samples: ordination (PCoA of bray-curtis dissimilarity)"
+author: 
+  - "Kadi Vaher"
+  - "This tutorial used as an example:"
+  - "https://ourcodingclub.github.io/tutorials/ordination/"
+date: '`r Sys.Date()`'
+output: html_document
+---
+
+```{r setup, include=F, message=F}
+
+library(tidyverse) 
+library(here) 
+library(phyloseq)
+#library(decontam)
+library(RColorBrewer)
+library(knitr)
+library(ggpubr)
+library(vegan)
+library(ggrepel)
+library(ape)
+
+# set paths
+knitr::opts_knit$set(root.dir=".", aliases=c(h = "fig.height", w = "fig.width", ow = "out.width"))
+knitr::opts_chunk$set(dev = c('png'), 
+                      fig.path = here("results", "figures", "ordination", ""), dpi = 300)
+theme_set(theme_light()) # global option for ggplot2
+```
+
+# Run the whole document - ONLY AT THE END OF THE WORKSTREAM
+
+```{r knit, echo=F, eval=FALSE}
+rmarkdown::render(input = here("scripts", "16S_ordination.Rmd"), output_dir = here("results", "reports"))
+```
+
+# Load functions
+
+Here load some custom functions which support the analysis below. The scripts for these functions can be found in the `src/`-folder.
+The load_dada is for creating the ASV names, filtering out 'Mitochondria', 'Chloroplast', 'Archae' or 'Eukaryota'
+
+```{r}
+source(here("src", "load_dada.R"))
+source(here("src", "utils_kadi.R"))
+
+```
+
+# Load files
+
+```{r, message = F}
+# load phyloseq object from qc and decontam process
+phy <- readRDS(here("processed_data", "qc_decontam", "ps_final.Rds"))
+phy_RA <- readRDS(here("processed_data", "qc_decontam", "ps_final_RA.Rds"))
+
+ntaxa(phy)
+nsamples(phy)
+
+```
+
+# PCoA using ape package
+Following this: https://ourcodingclub.github.io/tutorials/ordination/
+This only done using matching dataset (microbiota and brain imaging)
+
+First subset to the matching dataset and then calculate Bray-Curtis dissimilarity based on the TSS-normalised ASV table
+
+```{r matching_bc}
+
+#read in the matching dataset demographics
+matching_demo <- read.csv(here("processed_data", "demographics_microbiome_mri_79_10102022.csv"))
+
+#subset microbiota data to the matching sample and remove taxa not present in these samples
+disch_phy_matching <- phy %>% subset_samples((sample_id2 %in% matching_demo$sample_id)) %>% 
+  prune_taxa(taxa_sums(.) > 0, .)
+disch_phy_RA_matching <- phy_RA %>% subset_samples((sample_id2 %in% matching_demo$sample_id))%>% 
+  prune_taxa(taxa_sums(.) > 0, .)
+
+ntaxa(disch_phy_RA_matching)
+nsamples(disch_phy_RA_matching)
+
+#now calculate bray curtis dissimilarity matrix on the TSS-normalised ASV table
+# extracting data from phyloseq object to dataframes
+ASVm_disch_matching <- as(otu_table(disch_phy_RA_matching), "matrix")
+head(ASVm_disch_matching)
+
+# transpose
+tASVm_disch_matching <- t(ASVm_disch_matching)
+head(tASVm_disch_matching)
+
+# coerce to data.frame
+ASV_raw_disch_matching <- as.data.frame(tASVm_disch_matching)
+head(ASV_raw_disch_matching)
+
+# calculate bray-curtis dissimilarity matrix
+bc_disch_matching <- vegdist(ASV_raw_disch_matching, method = "bray")
+
+#visualise first rows
+bc_disch_matrix_matching <- as.matrix(bc_disch_matching)
+bc_disch_matrix_matching[1:5, 1:5]
+
+
+```
+
+Now calculate the PCoA and look into eigenvalues and % of variance explained
+
+```{r pcoa_matching, ow="50%"}
+
+#run PCoA; add correction to deal with negative eigenvalues
+PCOA_matching <- pcoa(bc_disch_matching, correction = "cailliez")
+
+# plot the eigenvalues and interpret
+barplot(PCOA_matching$values$Rel_corr_eig[1:10])
+
+#make in another way
+corrected_eigenvalues_matching <- as.data.frame(PCOA_matching$values)
+corrected_eigenvalues_matching$coordinate <- as.numeric(row.names(corrected_eigenvalues_matching))
+
+ggplot(data=corrected_eigenvalues_matching[1:20,], aes(x=coordinate, y=Corr_eig)) +
+  geom_line() + geom_point() + 
+  #scale_color_manual(values=c("#500870", "#CA3989", "#F1A90E", "#00966C", "#A77588", "#2EB1AB", "#BA2913")) + 
+  ylab("Corrected eigenvalue") + xlab("Principal coordinate") + 
+  #geom_hline(yintercept=1, linetype="dashed") +
+  #scale_y_continuous(breaks=seq(0,12,1)) +
+  theme_bw(base_size=20)
+
+screeplot_matching <- ggplot(data=corrected_eigenvalues_matching[1:20,], aes(x=coordinate, y=Rel_corr_eig)) +
+  geom_line() + geom_point() + 
+  #scale_color_manual(values=c("#500870", "#CA3989", "#F1A90E", "#00966C", "#A77588", "#2EB1AB", "#BA2913")) + 
+  ylab("Variance explained") + xlab("Principal coordinate") + 
+  #geom_hline(yintercept=1, linetype="dashed") +
+  scale_y_continuous(labels = scales::percent, limits=c(0,0.16)) +
+ # scale_y_continuous(breaks=seq(0,15,1)) +
+  theme_bw(base_size=13)
+
+screeplot_matching
+
+
+# Calculate the percent of variance explained cumulatively by the first few axes
+sum((as.vector(PCOA_matching$values$Rel_corr_eig)/sum(PCOA_matching$values$Rel_corr_eig))[1:1]) # 15.05%
+sum((as.vector(PCOA_matching$values$Rel_corr_eig)/sum(PCOA_matching$values$Rel_corr_eig))[1:2]) # 28.28%
+sum((as.vector(PCOA_matching$values$Rel_corr_eig)/sum(PCOA_matching$values$Rel_corr_eig))[1:3]) # 36.35%
+sum((as.vector(PCOA_matching$values$Rel_corr_eig)/sum(PCOA_matching$values$Rel_corr_eig))[1:4]) # 40.87%
+
+#variance for each of the first four PCo-s
+sum((as.vector(PCOA_matching$values$Rel_corr_eig)/sum(PCOA_matching$values$Rel_corr_eig))[1:1]) # 15.05%
+sum((as.vector(PCOA_matching$values$Rel_corr_eig)/sum(PCOA_matching$values$Rel_corr_eig))[2:2]) # 13.22%
+sum((as.vector(PCOA_matching$values$Rel_corr_eig)/sum(PCOA_matching$values$Rel_corr_eig))[3:3]) # 8.07%
+sum((as.vector(PCOA_matching$values$Rel_corr_eig)/sum(PCOA_matching$values$Rel_corr_eig))[4:4]) # 4.53%
+
+```
+
+Correlation of the first principal coordinates with the ASV relative abundances
+
+```{r pcoa_ape_axes_matching, ow="50%"}
+
+#take out the first 4 axes
+PCOAaxes_matching <- as.data.frame(PCOA_matching$vectors[,c(1:4)])
+
+#merge with the relative abundance table
+pcoa_ra_matching <- merge(PCOAaxes_matching, ASV_raw_disch_matching, by=0)
+row.names(pcoa_ra_matching) <- pcoa_ra_matching$Row.names
+pcoa_ra_matching <-  pcoa_ra_matching %>% select(-Row.names)
+
+#write out this file in order to use it later in data analysis
+write.csv(pcoa_ra_matching, here("processed_data", "matchingsample_pcoa_relativeabundances.csv"))
+
+#correlation matrix between the axes and RA of ASVs
+cor_mx_matching=cor(pcoa_ra_matching[,1:4],pcoa_ra_matching[,5:ncol(pcoa_ra_matching)], method = "spearman")
+
+#transform the correlation matrix and make into a dataframe
+cor_mx_t_matching <- t(cor_mx_matching) %>% data.frame()
+
+cor_mx_data_matching <- cor_mx_t_matching %>% mutate(ASV=row.names(cor_mx_t_matching)) %>% mutate(ASV_name = format_OTU(ASV))
+
+
+#put this into long format
+library(reshape)
+cor_mx_data_melt_matching <- melt(cor_mx_data_matching, id.vars = c("ASV", "ASV_name"), measure.vars = 1:4, variable_name="PCo")
+detach("package:reshape", unload=TRUE)
+
+cor_mx_data_melt_matching <- cor_mx_data_melt_matching %>% mutate(pos_neg = ifelse(value<0, "negative", "positive"))
+cor_mx_data_melt_matching$abs_value <- abs(cor_mx_data_melt_matching$value)
+
+a1_matching <- cor_mx_data_melt_matching %>% subset(PCo=="Axis.1") %>% slice_max(abs_value, n=30) %>%
+  ggplot(aes(x=value,y=reorder(ASV_name, -value), fill=pos_neg))+ 
+               geom_bar(stat = "identity" ,width = 0.7) +
+  theme(axis.text.y = ggtext::element_markdown(size=12), legend.position="none", axis.title.x = element_text(size = 12)) +
+  scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  ylab("ASV") + xlab("Spearman correlation coefficient") +
+  scale_x_continuous(breaks=seq(-0.8,0.8,0.2), limits=c(-0.8, 0.8))
+
+a2_matching <- cor_mx_data_melt_matching %>% subset(PCo=="Axis.2") %>% slice_max(abs_value, n=30) %>%
+  ggplot(aes(x=value,y=reorder(ASV_name, -value), fill=pos_neg))+ 
+               geom_bar(stat = "identity" ,width = 0.7) +
+  theme(axis.text.y = ggtext::element_markdown(size=12), legend.position="none", axis.title.x = element_text(size = 12)) +
+  scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  ylab("ASV") + xlab("Spearman correlation coefficient")+
+  scale_x_continuous(breaks=seq(-0.8,0.8,0.2), limits=c(-0.8, 0.8))
+
+a3_matching <- cor_mx_data_melt_matching %>% subset(PCo=="Axis.3") %>% slice_max(abs_value, n=30) %>%
+  ggplot(aes(x=value,y=reorder(ASV_name, -value), fill=pos_neg))+ 
+               geom_bar(stat = "identity" ,width = 0.7) +
+  theme(axis.text.y = ggtext::element_markdown(size=12), legend.position="none", axis.title.x = element_text(size = 12)) +
+  scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  ylab("ASV") + xlab("Spearman correlation coefficient")+
+  scale_x_continuous(breaks=seq(-0.8,0.8,0.2), limits=c(-0.8, 0.8))
+
+a4_matching <- cor_mx_data_melt_matching %>% subset(PCo=="Axis.4") %>% slice_max(abs_value, n=30) %>%
+  ggplot(aes(x=value,y=reorder(ASV_name, -value), fill=pos_neg))+ 
+               geom_bar(stat = "identity" ,width = 0.7) +
+  theme(axis.text.y = ggtext::element_markdown(size=12), legend.position="none", axis.title.x = element_text(size = 12)) +
+  scale_fill_manual(values=c("#34487A", "#CF5A47"), name="") +
+  ylab("ASV") + xlab("Spearman correlation coefficient")+
+  scale_x_continuous(breaks=seq(-0.8,0.8,0.2), limits=c(-0.8, 0.8))
+
+ggarrange(a1_matching, a2_matching, a3_matching, a4_matching, nrow=1, labels = c("PCo1, 15.05%", "PCo2, 13.22%", "PCo3, 8.07%", "PCo4, 4.53%"))
+
+joint_matching <- ggarrange(a1_matching, a2_matching, a3_matching, a4_matching, nrow=2, ncol=2, labels = c("PCo1, 15.05%", "PCo2, 13.22%", "PCo3, 8.07%", "PCo4, 4.53%"), font.label = list(size = 13))
+
+png(file=here("results", "figures", "pcoa_correlations_matchingsample.png"), width = 17, height =17 , units = "in",res=300)
+print(joint_matching)
+dev.off()
+
+#put also the screeplot here -> figure in the thesis
+joint_withscreeplot <- ggarrange(screeplot_matching, joint_matching, heights = c(1,4), nrow=2, labels=c("A", "B"))
+
+png(file=here("results", "figures", "pcoa_correlations_screeplot_matchingsample.png"), width = 17, height =20 , units = "in",res=300)
+print(joint_withscreeplot)
+dev.off()
+
+#Check the distribution of the coordinates and correlations between them
+hist(PCOAaxes_matching$Axis.1)
+hist(PCOAaxes_matching$Axis.2)
+hist(PCOAaxes_matching$Axis.3)
+hist(PCOAaxes_matching$Axis.4)
+
+cor.test(PCOAaxes_matching$Axis.1, PCOAaxes_matching$Axis.2)
+cor.test(PCOAaxes_matching$Axis.1, PCOAaxes_matching$Axis.3)
+cor.test(PCOAaxes_matching$Axis.1, PCOAaxes_matching$Axis.4)
+
+cor.test(PCOAaxes_matching$Axis.2, PCOAaxes_matching$Axis.3)
+cor.test(PCOAaxes_matching$Axis.2, PCOAaxes_matching$Axis.4)
+
+cor.test(PCOAaxes_matching$Axis.3, PCOAaxes_matching$Axis.4)
+
+```
