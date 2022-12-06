@@ -4,6 +4,11 @@ Code for the analyses presented in Chapter 5 and 6 of the PhD thesis
 
 Repository author: Kadi Vaher (kadi.vaher@ed.ac.uk)
 
+## Directory structure
+The project assumes the following file directory system:
+
+![image](https://user-images.githubusercontent.com/92927232/205872695-40a8f0e0-f4ea-498b-b03c-7ebc8b18e75c.png)
+
 The repository consists of the following folders:
 - **scripts/** containing R markdown/script files for creating the demographic and clinical variable descriptive tables, performing statistical analyses and constructing accompanying figures and tables
 - **src/** containing some custom functions used for loading data and creating figures
@@ -23,8 +28,5 @@ The repository consists of the following folders:
 - microbiota_brain_stats.Rmd: code for statistical analysis associating gut microbiota features with MRI features (regression and Maaslin2 models)
 - dGM_regionaldiff_microbiome_stats.Rmd: code for statistical analysis associating gut microbiota features with MRI features in the deep grey matter regions
 
-## Directory structure
-The project assumes the following file directory system:
 
-![image](https://user-images.githubusercontent.com/92927232/205872695-40a8f0e0-f4ea-498b-b03c-7ebc8b18e75c.png)
 
