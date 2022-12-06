@@ -22,3 +22,9 @@ The repository consists of the following folders:
 - explore_braindata.Rmd: code to analyse the effects of GA at scan and GA at birth on MRI features of interest
 - microbiota_brain_stats.Rmd: code for statistical analysis associating gut microbiota features with MRI features (regression and Maaslin2 models)
 - dGM_regionaldiff_microbiome_stats.Rmd: code for statistical analysis associating gut microbiota features with MRI features in the deep grey matter regions
+
+## Directory structure
+The project assumes the following file directory system:
+
+![image](https://user-images.githubusercontent.com/92927232/205872695-40a8f0e0-f4ea-498b-b03c-7ebc8b18e75c.png)
+
