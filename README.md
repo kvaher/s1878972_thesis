@@ -5,8 +5,8 @@ Code for the analyses presented in Chapter 5 and 6 of the PhD thesis
 Repository author: Kadi Vaher (kadi.vaher@ed.ac.uk)
 
 The repository consists of the following folders:
-- **scripts/** containing R markdown/script files for creating the demographic and clinical variable sescriptive tables, performing statistical analyses and constructing accompanying figures and tables
-- **src/** containing custom functions used for loading data and creating figures
+- **scripts/** containing R markdown/script files for creating the demographic and clinical variable descriptive tables, performing statistical analyses and constructing accompanying figures and tables
+- **src/** containing some custom functions used for loading data and creating figures
 
 ## Chapter 5.	Microbiota profiles and drivers in preterm neonates
 - qc_decontam.Rmd: code for the quality check and decontamination steps for the 16S rRNA sequencing data
